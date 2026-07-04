@@ -1,0 +1,67 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Robonix Webots CI Reports</title>
+<style>
+  :root {
+    --text: #111827;
+    --muted: #4b5563;
+    --line: #d1d5db;
+    --head: #f3f4f6;
+    --pass-bg: #f0fdf4;
+    --pass-line: #bbf7d0;
+    --pass-text: #166534;
+    --fail-bg: #fef2f2;
+    --fail-line: #fecaca;
+    --fail-text: #991b1b;
+    --panel: #ffffff;
+    --sans: Arial, Helvetica, "Liberation Sans", sans-serif;
+    --mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+  }
+  * { box-sizing: border-box; }
+  body {
+    background: #ffffff;
+    color: var(--text);
+    font-family: var(--sans);
+    font-size: 13px;
+    line-height: 1.35;
+    margin: 24px;
+  }
+  h1 { font-size: 22px; margin: 0 0 4px; }
+  .subtitle { color: var(--muted); font-size: 13px; margin: 0 0 14px; }
+  .summary { display: flex; flex-wrap: wrap; gap: 8px; margin: 14px 0; }
+  .card { border: 1px solid var(--line); border-radius: 0; min-width: 140px; padding: 8px 10px; }
+  .card strong { color: var(--muted); display: block; font-size: 11px; margin-bottom: 6px; text-transform: uppercase; }
+  .metric { font-size: 16px; font-weight: 700; }
+  .table-scroll { overflow-x: auto; width: 100%; }
+  table { border-collapse: collapse; border-spacing: 0; border: 1px solid var(--line); margin-top: 12px; min-width: 1120px; width: 100%; }
+  th, td { border-bottom: 1px solid var(--line); padding: 6px 8px; text-align: left; vertical-align: top; }
+  th { background: var(--head); color: #374151; font-size: 11px; font-weight: 700; text-transform: uppercase; white-space: nowrap; }
+  tr:last-child td { border-bottom: 0; }
+  .row-pass { background: var(--pass-bg); }
+  .row-pass td { border-bottom-color: var(--pass-line); }
+  .row-fail { background: var(--fail-bg); }
+  .row-fail td { border-bottom-color: var(--fail-line); }
+  a { color: #1d4ed8; text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  .mono { font-family: var(--mono); font-size: 11px; white-space: nowrap; }
+  .score { font-weight: 700; }
+  .result-badge { border: 1px solid currentColor; display: inline-block; font-family: var(--mono); font-size: 11px; font-weight: 700; padding: 2px 6px; }
+  .result-badge.pass { background: var(--pass-bg); color: var(--pass-text); }
+  .result-badge.fail { background: var(--fail-bg); color: var(--fail-text); }
+</style>
+<h1>Robonix Webots CI Reports</h1>
+<p class="subtitle">Reports are retained for 90 days. Generated on <span class="mono">2026-07-04T15:49:16+08:00</span>.</p>
+<div class="summary">
+  <div class="card"><strong>Total Reports</strong><div class="metric">1</div></div>
+  <div class="card"><strong>Passed Reports</strong><div class="metric">0</div></div>
+  <div class="card"><strong>Retention</strong><div class="metric">90 days</div></div>
+</div>
+<div class="table-scroll">
+<table>
+  <thead><tr><th>Run</th><th>Result</th><th>Score</th><th>Scenarios</th><th>Title</th><th>Generated</th><th>Event</th><th>PR</th><th>Commit</th><th>Actor</th></tr></thead>
+  <tbody>
+<tr class="row-fail"><td class="mono"><a href="runs/28699610102/">28699610102</a></td><td><span class="result-badge fail">NO DATA</span></td><td class="mono score">0</td><td class="mono">0/0</td><td>28699610102</td><td class="mono">2026-07-04T15:49:03+08:00</td><td class="mono">push</td><td class="mono">-</td><td class="mono">-</td><td class="mono">ohhhHwH</td></tr>
+  </tbody>
+</table>
+</div>

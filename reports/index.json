@@ -1,0 +1,16 @@
+[
+  {
+    "run_id": "28699610102",
+    "generated_on": "2026-07-04T15:49:03+08:00",
+    "title": "28699610102",
+    "result": "NO DATA",
+    "score": "0",
+    "scenarios": "0/0",
+    "event": "push",
+    "workflow": "Webots Integration Tests",
+    "actor": "ohhhHwH",
+    "commit": "",
+    "pr_number": "",
+    "url": "runs/28699610102/"
+  }
+]

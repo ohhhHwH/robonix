@@ -1,0 +1,523 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Robonix Webots CI Report</title>
+  <style>
+    :root {
+      --text: #111827;
+      --muted: #6b7280;
+      --line: #d1d5db;
+      --head: #f3f4f6;
+      --pass-bg: #ecfdf5;
+      --pass-border: #a7f3d0;
+      --pass-text: #065f46;
+      --fail-bg: #fef2f2;
+      --fail-border: #fecaca;
+      --fail-text: #991b1b;
+      --panel: #ffffff;
+      --sans: Arial, Helvetica, "Liberation Sans", sans-serif;
+      --mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+    }
+    * { box-sizing: border-box; }
+    body {
+      background: #ffffff;
+      color: var(--text);
+      font-family: var(--sans);
+      font-size: 13px;
+      line-height: 1.35;
+      margin: 24px;
+    }
+    h1 { font-size: 22px; margin: 0 0 4px; }
+    .subtitle { color: var(--muted); font-size: 13px; margin: 0 0 16px; }
+    .report-nav { margin: 8px 0 14px; }
+    .report-nav a {
+      background: #e5e7eb;
+      border: 2px solid #6b7280;
+      color: #111827;
+      display: inline-block;
+      font-family: var(--mono);
+      font-size: 12px;
+      font-weight: 700;
+      padding: 6px 10px;
+      text-decoration: none;
+      text-transform: uppercase;
+    }
+    .report-nav a:hover { background: #d1d5db; text-decoration: underline; }
+    h2 { font-size: 16px; margin: 24px 0 10px; }
+    table {
+      border-collapse: collapse;
+      border-spacing: 0;
+      width: 100%;
+      margin-top: 12px;
+      border: 1px solid var(--line);
+      border-radius: 0;
+      overflow: visible;
+    }
+    th, td {
+      border-bottom: 1px solid var(--line);
+      padding: 6px 8px;
+      text-align: left;
+      vertical-align: top;
+    }
+    th { background: var(--head); color: #374151; font-size: 11px; font-weight: 700; text-transform: uppercase; }
+    tr:last-child td { border-bottom: 0; }
+    .mono {
+      background: transparent;
+      border: 0;
+      border-radius: 0;
+      font-family: var(--mono);
+      font-size: 11px;
+      padding: 0;
+      white-space: pre-wrap;
+      word-break: normal;
+    }
+    .scenario-scroll {
+      overflow-x: auto;
+      width: 100%;
+    }
+    .scenario-table {
+      min-width: 1180px;
+      table-layout: auto;
+    }
+    .scenario-table th:nth-child(1),
+    .scenario-table td:nth-child(1) { width: 78px; white-space: nowrap; }
+    .scenario-table th:nth-child(2),
+    .scenario-table td:nth-child(2) { width: 92px; white-space: nowrap; }
+    .scenario-table th:nth-child(3),
+    .scenario-table td:nth-child(3) { width: 210px; white-space: nowrap; }
+    .scenario-table th:nth-child(4),
+    .scenario-table td:nth-child(4) { width: 72px; white-space: nowrap; }
+    .summary { display: flex; flex-wrap: wrap; gap: 8px; margin: 14px 0; }
+    .card { border: 1px solid var(--line); border-radius: 0; min-width: 140px; padding: 8px 10px; }
+    .card strong { color: var(--muted); display: block; font-size: 11px; margin-bottom: 6px; text-transform: uppercase; }
+    .metric { font-size: 16px; font-weight: 700; }
+    .score-metric {
+      font-family: var(--mono);
+    }
+    .result-metric {
+      border: 1px solid currentColor;
+      display: inline-block;
+      font-family: var(--mono);
+      font-size: 12px;
+      padding: 2px 7px;
+    }
+    .result-metric.pass { background: var(--pass-bg); color: var(--pass-text); }
+    .result-metric.fail { background: var(--fail-bg); color: var(--fail-text); }
+    .row-pass { background: var(--pass-bg); }
+    .row-fail { background: var(--fail-bg); }
+    .row-pass td { border-bottom-color: var(--pass-border); }
+    .row-fail td { border-bottom-color: var(--fail-border); }
+    .status-badge {
+      border-radius: 0;
+      display: inline-block;
+      font-family: var(--mono);
+      font-size: 11px;
+      font-weight: 700;
+      letter-spacing: 0;
+      min-width: 42px;
+      padding: 2px 6px;
+      text-align: center;
+    }
+    .status-badge.pass { background: #d1fae5; color: var(--pass-text); }
+    .status-badge.fail { background: #fee2e2; color: var(--fail-text); }
+    .contract, .path, .suite, .scenario, .failure-text { font-weight: 500; }
+    .suite, .scenario, .contract, .path {
+      white-space: nowrap;
+    }
+    .failure-text {
+      overflow-wrap: break-word;
+      white-space: pre-wrap;
+      word-break: normal;
+    }
+    .mono-line {
+      max-width: 520px;
+      overflow-x: auto;
+      padding-bottom: 2px;
+      white-space: nowrap;
+    }
+    .rtdl-scenario {
+      border-top: 1px solid var(--line);
+      padding: 12px 0;
+    }
+    .rtdl-scenario:first-child { border-top: 0; }
+    .rtdl-scenario > summary {
+      align-items: center;
+      cursor: pointer;
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+    }
+    .rtdl-step {
+      margin: 10px 0 0 24px;
+    }
+    .rtdl-step > summary {
+      cursor: pointer;
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-bottom: 6px;
+    }
+    .rtdl-step-title, .rtdl-op, .rtdl-id, .rtdl-args, .rtdl-expect, .rtdl-json {
+      font-family: var(--mono);
+      font-size: 11px;
+    }
+    .rtdl-step-title, .rtdl-op {
+      color: #111827;
+      font-weight: 650;
+    }
+    .rtdl-step-desc, .rtdl-step-meta, .rtdl-id {
+      color: var(--muted);
+      font-size: 12px;
+    }
+    .rtdl-node {
+      margin: 5px 0 0 18px;
+      padding-left: 12px;
+      position: relative;
+    }
+    .rtdl-node::before {
+      background: var(--line);
+      content: "";
+      height: 1px;
+      left: 0;
+      position: absolute;
+      top: 9px;
+      width: 8px;
+    }
+    .rtdl-children {
+      border-left: 1px solid var(--line);
+      margin-left: 4px;
+      padding-left: 0;
+    }
+    .rtdl-line {
+      align-items: baseline;
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      min-height: 18px;
+    }
+    .rtdl-leaf .rtdl-line {
+      background: #f9fafb;
+      border-radius: 0;
+      padding: 2px 4px;
+    }
+    .rtdl-expect {
+      color: #374151;
+    }
+    .observed-round {
+      margin: 8px 0 0 30px;
+    }
+    .observed-title {
+      color: var(--muted);
+      font-size: 12px;
+      margin-bottom: 4px;
+    }
+    .observed-call {
+      align-items: baseline;
+      background: var(--pass-bg);
+      border-radius: 0;
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin: 3px 0;
+      padding: 4px 6px;
+    }
+    .observed-fail {
+      background: var(--fail-bg);
+    }
+    .observed-output {
+      color: #374151;
+      font-family: var(--mono);
+      font-size: 11px;
+      max-width: 100%;
+      overflow-wrap: anywhere;
+      white-space: pre-wrap;
+    }
+    .failure-line { margin-bottom: 6px; }
+    .failure-line:last-child { margin-bottom: 0; }
+    .number {
+      color: #374151;
+      font-family: var(--mono);
+      text-align: right;
+      white-space: nowrap;
+    }
+    .muted { color: var(--muted); }
+    ul { padding-left: 20px; }
+    li { margin: 6px 0; }
+    .link-button {
+      appearance: none;
+      background: transparent;
+      border: 0;
+      color: #1d4ed8;
+      cursor: pointer;
+      font: inherit;
+      padding: 0;
+      text-align: left;
+      text-decoration: underline;
+    }
+    .path-link {
+      font-family: var(--mono);
+      font-size: 11px;
+    }
+    .log-panel {
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      display: grid;
+      grid-template-columns: minmax(240px, 28%) 1fr;
+      min-height: 520px;
+      overflow: hidden;
+    }
+    .log-tree {
+      background: #f9fafb;
+      border-right: 1px solid var(--line);
+      max-height: 760px;
+      overflow: auto;
+      padding: 12px;
+    }
+    .tree-group { margin-bottom: 10px; }
+    .tree-group summary {
+      cursor: pointer;
+      font-weight: 700;
+      margin-bottom: 6px;
+    }
+    .tree-file {
+      appearance: none;
+      background: transparent;
+      border: 0;
+      border-radius: 4px;
+      color: var(--text);
+      cursor: pointer;
+      display: block;
+      padding: 6px 8px;
+      text-align: left;
+      width: 100%;
+    }
+    .tree-file:hover, .tree-file.active { background: #e5e7eb; }
+    .tree-name {
+      display: block;
+      font-family: var(--mono);
+      font-size: 11px;
+      overflow-wrap: anywhere;
+    }
+    .tree-meta { color: var(--muted); display: block; font-size: 11px; margin-top: 2px; }
+    .viewer { min-width: 0; }
+    .viewer-head {
+      align-items: center;
+      border-bottom: 1px solid var(--line);
+      display: flex;
+      gap: 10px;
+      justify-content: space-between;
+      padding: 10px 12px;
+    }
+    .viewer-title {
+      font-family: var(--mono);
+      font-size: 11px;
+      overflow-wrap: anywhere;
+    }
+    .viewer-meta { color: var(--muted); font-size: 11px; white-space: nowrap; }
+    .log-view {
+      background: #0b1020;
+      color: #e5e7eb;
+      font-family: var(--mono);
+      font-size: 11px;
+      line-height: 1.45;
+      max-height: 700px;
+      overflow: auto;
+      padding: 8px 0;
+    }
+    .log-line {
+      display: grid;
+      grid-template-columns: 64px minmax(0, 1fr);
+      min-height: 18px;
+    }
+    .log-line:hover { background: rgba(255, 255, 255, 0.06); }
+    .line-no {
+      color: #6b7280;
+      padding: 0 10px;
+      text-align: right;
+      user-select: none;
+    }
+    .line-text {
+      background: transparent;
+      border: 0;
+      color: inherit;
+      display: block;
+      font: inherit;
+      padding: 0 14px 0 0;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+    .tok-key { color: #93c5fd; }
+    .tok-string { color: #86efac; }
+    .tok-number { color: #fbbf24; }
+    .tok-bool { color: #c4b5fd; }
+    .tok-comment { color: #9ca3af; }
+    .tok-error { color: #fca5a5; font-weight: 700; }
+    .tok-warn { color: #fde68a; font-weight: 700; }
+    .tok-pass { color: #86efac; font-weight: 700; }
+    .analysis-card {
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      padding: 14px 16px;
+      margin: 12px 0 22px;
+    }
+    .analysis-available { background: #f8fafc; }
+    .analysis-unavailable { background: #f9fafb; }
+    .analysis-title {
+      font-size: 16px;
+      font-weight: 700;
+      margin-bottom: 4px;
+    }
+    .analysis-meta {
+      color: var(--muted);
+      font-family: var(--mono);
+      font-size: 11px;
+      margin: 0 0 10px;
+    }
+    .analysis-card h3 {
+      font-size: 12px;
+      margin: 14px 0 6px;
+      text-transform: uppercase;
+    }
+    .evidence-table th:nth-child(1),
+    .evidence-table td:nth-child(1) { width: 240px; }
+    .evidence-table th:nth-child(2),
+    .evidence-table td:nth-child(2) { width: 80px; }
+    .metadata th {
+      text-transform: none;
+      width: 180px;
+    }
+    .metadata td {
+      font-family: var(--mono);
+      font-size: 11px;
+      word-break: break-word;
+    }
+    .section-note {
+      color: var(--muted);
+      margin: 6px 0 10px;
+    }
+    .coverage-table td:first-child {
+      color: #374151;
+      font-family: var(--mono);
+      font-size: 11px;
+      white-space: nowrap;
+      width: 220px;
+    }
+  </style>
+</head>
+<body>
+  <h1>Robonix Webots CI Report</h1>
+  <div class="report-nav"><a href="../../">ALL REPORTS &gt;&gt;</a></div>
+  <p class="subtitle">Generated on 2026-07-05T16:31:31+08:00</p>
+  <div class="summary">
+    <div class="card"><strong>Result</strong><span class="metric result-metric fail">NO DATA</span></div>
+    <div class="card"><strong>Scenarios</strong><span class="metric">0/0 passed</span></div>
+    <div class="card"><strong>Failures</strong><span class="metric">0</span></div>
+    <div class="card"><strong>Score</strong><span class="metric score-metric">0/100</span></div>
+  </div>
+  <h2>LLM-Assisted Analysis</h2><section class="analysis-card analysis-unavailable"><div class="analysis-title">LLM analysis disabled</div><p>LLM analysis was not requested for this report.</p><p class="muted">LLM analysis was not available; deterministic logs remain embedded below.</p></section>
+  <h2>Run Metadata</h2>
+  <table class="metadata"><tbody><tr><th>Generated On</th><td>2026-07-05T16:31:31+08:00</td></tr><tr><th>Run Id</th><td><a href="https://github.com/ohhhHwH/robonix/actions/runs/28700601679">28700601679</a></td></tr><tr><th>Workflow</th><td>Webots Integration Tests</td></tr><tr><th>Event</th><td>push</td></tr><tr><th>Repository</th><td>ohhhHwH/robonix</td></tr><tr><th>Triggered By</th><td>ohhhHwH</td></tr><tr><th>Actor</th><td>ohhhHwH</td></tr><tr><th>Triggering Actor</th><td>ohhhHwH</td></tr><tr><th>Runner Name</th><td>GitHub Actions 1000000084</td></tr><tr><th>Runner Os</th><td>Linux</td></tr><tr><th>Runner Arch</th><td>X64</td></tr><tr><th>Run Attempt</th><td>1</td></tr><tr><th>Ref</th><td>refs/heads/dev</td></tr><tr><th>Sha</th><td><a href="https://github.com/ohhhHwH/robonix/commit/85f126a18ce0e71f986b04776bf57dcb7a9d8004">85f126a18ce0</a></td></tr><tr><th>Report Id</th><td>28700601679</td></tr><tr><th>Test Ref</th><td>refs/heads/dev</td></tr></tbody></table>
+  <h2>Test Environment</h2>
+  <p class="muted">No test environment metadata was provided.</p>
+  <h2>Scenarios</h2>
+  <div class="scenario-scroll">
+  <table class="scenario-table">
+    <thead><tr><th>Status</th><th>Suite</th><th>Scenario</th><th>Rounds</th><th>Dispatched contracts</th><th>Failures</th><th>Log</th></tr></thead>
+    <tbody></tbody>
+  </table>
+  </div>
+  <h2>RTDL Plan Trees</h2>
+  <p class="section-note">Each scenario step is one VLM planning round. The tree below is the RTDL returned for that round; every <span class="mono">do</span> leaf has its own expected runtime contract and output checks.</p>
+  <div class="rtdl-tree-list"><p class="muted">No RTDL plan trees were recorded in the summary.</p></div>
+  <h2>Logs</h2>
+  <div class="log-panel">
+    <aside class="log-tree"><details class="tree-group" open><summary>testing</summary>
+<button class="tree-file" data-log-id="log-0" onclick="openLog(this.dataset.logId)"><span class="tree-name">logs/diagnostic-context.json</span><span class="tree-meta">json · 1231 B</span></button>
+<button class="tree-file" data-log-id="log-1" onclick="openLog(this.dataset.logId)"><span class="tree-name">logs/llm-analysis.json</span><span class="tree-meta">json · 125 B</span></button>
+<button class="tree-file" data-log-id="log-2" onclick="openLog(this.dataset.logId)"><span class="tree-name">logs/synthetic-summary.json</span><span class="tree-meta">json · 207 B</span></button>
+</details></aside>
+    <section class="viewer">
+      <div class="viewer-head">
+        <div id="viewer-title" class="viewer-title">Select a log</div>
+        <div id="viewer-meta" class="viewer-meta"></div>
+      </div>
+      <div id="log-view" class="log-view"><div class="log-line"><span class="line-no">-</span><code class="line-text">No log selected.</code></div></div>
+    </section>
+  </div>
+  <h2>Runtime Contract Coverage</h2>
+  <p class="section-note">Contracts observed by the scenario runner in executor leaf results. This shows which runtime contract ids were exercised by this run; it is not a full API inventory.</p><table class="coverage-table"><thead><tr><th>Area</th><th>Contract id</th></tr></thead><tbody><tr><td colspan="2"><span class="muted">No runtime contracts were recorded.</span></td></tr></tbody></table>
+  <script>
+    const LOGS = [{"id": "log-0", "name": "diagnostic-context.json", "path": "testing/logs/diagnostic-context.json", "size": 1231, "truncated": false, "language": "json", "content": "{\n  \"schema_version\": 1,\n  \"purpose\": \"LLM-assisted CI diagnostic note for Robonix Webots integration tests\",\n  \"rules\": [\n    \"Use only this context; do not infer from unavailable repository files.\",\n    \"Do not decide pass/fail; status is determined by CI scripts.\",\n    \"Mention uncertainty when evidence is incomplete.\"\n  ],\n  \"metadata\": {\n    \"report_id\": \"28700601679\",\n    \"run_url\": \"https://github.com/ohhhHwH/robonix/actions/runs/28700601679\",\n    \"pr_number\": \"\",\n    \"pr_title\": \"\",\n    \"pr_author\": \"\",\n    \"pr_url\": \"\",\n    \"pr_head_ref\": \"\",\n    \"pr_head_repo\": \"\",\n    \"pr_head_sha\": \"\",\n    \"pr_head_commit_url\": \"\",\n    \"test_ref\": \"refs/heads/dev\",\n    \"triggered_by\": \"ohhhHwH\"\n  },\n  \"summary\": {\n    \"total\": 0,\n    \"passed\": 0,\n    \"failed\": 0,\n    \"rate\": 0,\n    \"scenarios\": [],\n    \"coverage\": [],\n    \"infrastructure_note\": \"No machine-readable scenario summary was produced; logs are still embedded below.\"\n  },\n  \"change_set\": {\n    \"source\": \"unavailable\",\n    \"strict_rule\": \"Summarize code changes only from pr_files or git_diff. Do not infer changes from logs, capability catalogs, provider names, repository layout, or existing files.\",\n    \"pr_files\": [],\n    \"git_diff\": \"\"\n  },\n  \"logs\": []\n}\n"}, {"id": "log-1", "name": "llm-analysis.json", "path": "testing/logs/llm-analysis.json", "size": 125, "truncated": false, "language": "json", "content": "{\n  \"available\": false,\n  \"title\": \"LLM analysis disabled\",\n  \"summary\": \"LLM analysis was not requested for this report.\"\n}\n"}, {"id": "log-2", "name": "synthetic-summary.json", "path": "testing/logs/synthetic-summary.json", "size": 207, "truncated": false, "language": "json", "content": "{\n  \"total\": 0,\n  \"passed\": 0,\n  \"failed\": 0,\n  \"rate\": 0,\n  \"scenarios\": [],\n  \"coverage\": [],\n  \"infrastructure_note\": \"No machine-readable scenario summary was produced; logs are still embedded below.\"\n}\n"}];
+    const LOG_BY_ID = new Map(LOGS.map((entry) => [entry.id, entry]));
+    const LOG_BY_NAME = new Map();
+    for (const entry of LOGS) {
+      if (!LOG_BY_NAME.has(entry.name)) LOG_BY_NAME.set(entry.name, entry);
+      const pathTail = entry.path.split('/').slice(-1)[0];
+      if (!LOG_BY_NAME.has(pathTail)) LOG_BY_NAME.set(pathTail, entry);
+    }
+
+    function escapeHtml(value) {
+      return String(value)
+        .replaceAll('&', '&amp;')
+        .replaceAll('<', '&lt;')
+        .replaceAll('>', '&gt;')
+        .replaceAll('"', '&quot;')
+        .replaceAll("'", '&#39;');
+    }
+
+    function highlightLine(line, language) {
+      let out = escapeHtml(line);
+      if (language === 'json' || language === 'jsonl') {
+        out = out.replace(/(&quot;[^&]*?&quot;)(\s*:)/g, '<span class="tok-key">$1</span>$2');
+        out = out.replace(/(:\s*)(&quot;[^&]*?&quot;)/g, '$1<span class="tok-string">$2</span>');
+        out = out.replace(/(:\s*)(-?\d+(?:\.\d+)?)/g, '$1<span class="tok-number">$2</span>');
+        out = out.replace(/\b(true|false|null)\b/g, '<span class="tok-bool">$1</span>');
+      } else if (language === 'yaml' || language === 'toml') {
+        out = out.replace(/^([\w.-]+)(\s*[:=])/g, '<span class="tok-key">$1</span>$2');
+        out = out.replace(/(#.*)$/g, '<span class="tok-comment">$1</span>');
+      } else if (language === 'py' || language === 'sh' || language === 'rs' || language === 'js' || language === 'ts') {
+        out = out.replace(/(#.*)$/g, '<span class="tok-comment">$1</span>');
+        out = out.replace(/(\/\/.*)$/g, '<span class="tok-comment">$1</span>');
+      }
+      out = out.replace(/\b(ERROR|FAIL|FAILED|Traceback|Exception)\b/g, '<span class="tok-error">$1</span>');
+      out = out.replace(/\b(WARN|WARNING)\b/g, '<span class="tok-warn">$1</span>');
+      out = out.replace(/\b(PASS|SUCCESS|OK)\b/g, '<span class="tok-pass">$1</span>');
+      return out;
+    }
+
+    function renderLog(entry) {
+      document.getElementById('viewer-title').textContent = entry.path;
+      const suffix = entry.truncated ? ' · truncated' : '';
+      document.getElementById('viewer-meta').textContent = `${entry.language} · ${entry.size} B${suffix}`;
+      document.querySelectorAll('.tree-file').forEach((el) => {
+        el.classList.toggle('active', el.dataset.logId === entry.id);
+      });
+      const lines = entry.content.split(/\r?\n/);
+      const html = lines.map((line, idx) => (
+        `<div class="log-line"><span class="line-no">${idx + 1}</span><code class="line-text">${highlightLine(line, entry.language)}</code></div>`
+      )).join('');
+      document.getElementById('log-view').innerHTML = html || '<div class="log-line"><span class="line-no">1</span><code class="line-text"></code></div>';
+    }
+
+    function openLog(id) {
+      const entry = LOG_BY_ID.get(id);
+      if (entry) renderLog(entry);
+    }
+
+    function openLogByName(name) {
+      const entry = LOG_BY_NAME.get(name);
+      if (entry) {
+        renderLog(entry);
+        document.getElementById('log-view').scrollIntoView({block: 'nearest'});
+      } else {
+        document.getElementById('viewer-title').textContent = `Log not embedded: ${name}`;
+        document.getElementById('viewer-meta').textContent = '';
+        document.getElementById('log-view').innerHTML = '<div class="log-line"><span class="line-no">-</span><code class="line-text">No matching embedded log.</code></div>';
+      }
+    }
+
+    if (LOGS.length) renderLog(LOGS[0]);
+  </script>
+</body>
+</html>

@@ -1,0 +1,9 @@
+{
+  "total": 0,
+  "passed": 0,
+  "failed": 0,
+  "rate": 0,
+  "scenarios": [],
+  "coverage": [],
+  "infrastructure_note": "No machine-readable scenario summary was produced; logs are still embedded below."
+}

@@ -57,6 +57,9 @@ class Detection:
     bbox: BBox3D
     confidence: float
     source: str = "perception"
+    # 2D bounding box in image pixels [x0, y0, x1, y1].  None when the
+    # detector doesn't provide one (e.g. LiDAR-only or CG path).
+    bbox_2d: Optional[tuple[float, float, float, float]] = None
 
 
 def _gate_radius(label: str) -> float:
@@ -176,6 +179,8 @@ def associate(
                 yaw=d.bbox.yaw,
                 frame_id=d.bbox.frame_id,
             )
+            if d.bbox_2d is not None:
+                o.last_bbox_2d = d.bbox_2d
             matched_ids.append(o.object_id)
 
         for i, d in enumerate(dets):

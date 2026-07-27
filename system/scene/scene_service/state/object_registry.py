@@ -10,7 +10,7 @@ import warnings
 import re
 import time
 from dataclasses import dataclass, field
-from typing import Iterable, Optional
+from typing import Iterable, Optional, Tuple
 
 
 # Free-form `attributes: dict[str, Any]` is convenient but easy to drift;
@@ -115,6 +115,9 @@ class SceneObject:
     caption_updated_at: float = 0.0
     caption_source: str = ""      # "model" | "operator" | "" (none yet)
     attributes: dict[str, object] = field(default_factory=dict)
+    # Latest 2D bounding-box in image pixels [x0, y0, x1, y1] from the
+    # VLM detector.  None when unavailable (e.g. ConceptGraphs path).
+    last_bbox_2d: Optional[tuple[float, float, float, float]] = None
 
     @property
     def settled(self) -> bool:

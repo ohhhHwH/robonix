@@ -56,6 +56,7 @@ echo "[sim/stop] killing host-side python service zombies (speech / memsearch / 
 # model and a stale TCP port that the next boot can't rebind.
 kill_ours "speech_service\\.service"
 kill_ours "memsearch_service\\.service"
+kill_ours "memory_service\\.service"
 kill_ours "scene_service\\.service"
 kill_ours "audio_driver\\.main|audio_driver\\.node"
 kill_ours "audio_client_bridge\\.main|audio_client_bridge\\.node"

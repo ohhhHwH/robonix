@@ -952,6 +952,47 @@ fn record_dispatched_plan(history: &mut Vec<Message>, plan: &Plan, description: 
     history::trim(history, MAX_HISTORY);
 }
 
+/// Flush accumulated successful RTDL steps as a single complete memory node.
+///
+/// Called at every turn exit point (task done, abort, hit_cap, recovery)
+/// to avoid fragmenting one user question into N one-step plan nodes.
+fn flush_accumulated_plan(
+    accumulated_steps: &mut Vec<TreeStep>,
+    accumulated_descriptions: &mut Vec<String>,
+    remember_target: &Option<(String, String)>,
+    user_goal: &str,
+    executor_graph: crate::pb::contracts::robonix_system_executor_execute_client::RobonixSystemExecutorExecuteClient<tonic::transport::Channel>,
+) {
+    if accumulated_steps.is_empty() {
+        return;
+    }
+    if let Some(target) = remember_target {
+        if user_goal.is_empty() {
+            return;
+        }
+        let steps = std::mem::take(accumulated_steps);
+        let descs = std::mem::take(accumulated_descriptions);
+        let n_trees = descs.len();
+        let plan_desc = if n_trees > 0 {
+            format!(
+                "complete task ({} step(s) across {} planning round(s))",
+                steps.len(),
+                n_trees,
+            )
+        } else {
+            format!("complete task ({} step(s))", steps.len())
+        };
+        memory::save_plan(
+            executor_graph,
+            target.clone(),
+            String::new(),
+            user_goal.to_string(),
+            plan_desc,
+            steps,
+        );
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn run_turn(
     task: &Task,
@@ -1020,7 +1061,7 @@ pub async fn run_turn(
     // rename it freely. contract_id is the stable identity.
     let search_memory_target = initial_caps
         .iter()
-        .find(|(_, cap)| cap.contract_id == "robonix/service/memory/search")
+        .find(|(_, cap)| cap.contract_id == "robonix/service/memory/hybrid_search")
         .map(|(provider_id, cap)| (provider_id.clone(), cap.contract_id.clone()));
 
     // Also discover the remember capability for saving successful plans later.
@@ -1146,9 +1187,33 @@ pub async fn run_turn(
     // Last user-facing narration; surfaced as FinalText when the turn ends.
     let mut last_content = String::new();
 
+    // Accumulate successful steps across all planning rounds in this turn.
+    // At turn end (task done, abort, or max rounds), flush them as ONE
+    // complete memory node per user question instead of one per tree.
+    let mut accumulated_steps: Vec<TreeStep> = Vec::new();
+    let mut accumulated_descriptions: Vec<String> = Vec::new();
+
+    // Helper macro: flush accumulated plan steps at turn exit.
+    // Used both at normal exit points and error-return paths.
+    macro_rules! flush_on_exit {
+        () => {
+            flush_accumulated_plan(
+                &mut accumulated_steps,
+                &mut accumulated_descriptions,
+                &remember_memory_target,
+                standing_task
+                    .as_ref()
+                    .map(|s| s.goal.as_str())
+                    .unwrap_or(""),
+                executor.graph.clone(),
+            )
+        };
+    }
+
     'supervisor: loop {
         // Check for hard interrupt at the top of every iteration.
         if *cancel_rx.borrow() {
+            flush_on_exit!();
             return_interrupted!(&forest);
         }
 
@@ -1160,6 +1225,7 @@ pub async fn run_turn(
                 .unwrap_or(false);
             if forest.is_empty() {
                 if task_done || standing_task.is_none() {
+                    flush_on_exit!();
                     let _ = tx
                         .send(Ok(service::pack(
                             &session_id,
@@ -1175,6 +1241,13 @@ pub async fn run_turn(
                 tokio::select! {
                     biased;
                     _ = cancel_rx.changed() => {
+                        flush_accumulated_plan(
+                            &mut accumulated_steps,
+                            &mut accumulated_descriptions,
+                            &remember_memory_target,
+                                standing_task.as_ref().map(|s| s.goal.as_str()).unwrap_or(""),
+                                executor.graph.clone(),
+                            );
                         return_interrupted!(&forest);
                     }
                     steer = steer_rx.recv() => {
@@ -1185,7 +1258,16 @@ pub async fn run_turn(
                                     should_plan = true;
                                 }
                             }
-                            None => break,
+                            None => {
+                                flush_accumulated_plan(
+                                    &mut accumulated_steps,
+                                    &mut accumulated_descriptions,
+                                    &remember_memory_target,
+                                        standing_task.as_ref().map(|s| s.goal.as_str()).unwrap_or(""),
+                                        executor.graph.clone(),
+                                    );
+                                break;
+                            }
                         }
                     }
                 }
@@ -1196,6 +1278,13 @@ pub async fn run_turn(
             tokio::select! {
                 biased;
                 _ = cancel_rx.changed() => {
+                    flush_accumulated_plan(
+                        &mut accumulated_steps,
+                        &mut accumulated_descriptions,
+                        &remember_memory_target,
+                            standing_task.as_ref().map(|s| s.goal.as_str()).unwrap_or(""),
+                            executor.graph.clone(),
+                        );
                     return_interrupted!(&forest);
                 }
                 steer = steer_rx.recv() => {
@@ -1265,27 +1354,19 @@ pub async fn run_turn(
                                 .await;
                         }
                         Some(ForestEvent::PlanDone { plan_id, results, any_failed, canceled }) => {
-                            // ── Save successful plan as a reusable memory node ──
-                            // Fire-and-forget: spawns a background task to call
-                            // memory/remember with the RTDL steps and user query.
-                            if !any_failed && !canceled {
-                                if let Some(tree_meta) = forest.get(&plan_id) {
-                                    if let Some(ref target) = remember_memory_target {
-                                        let user_goal = standing_task
-                                            .as_ref()
-                                            .map(|s| s.goal.clone())
-                                            .unwrap_or_default();
-                                        if !user_goal.is_empty() {
-                                            memory::save_plan(
-                                                executor.graph.clone(),
-                                                target.clone(),
-                                                plan_id.clone(),
-                                                user_goal,
-                                                tree_meta.description.clone(),
-                                                tree_meta.steps.clone(),
-                                            );
-                                        }
-                                    }
+                            // ── Collect successful steps for end-of-turn plan save ──
+                            // Instead of saving each tree independently (which
+                            // fragments one user question into N one-step nodes),
+                            // accumulate successful steps here and flush ONE
+                            // complete node when the turn ends.
+                            if !any_failed
+                                && !canceled
+                                && let Some(tree_meta) = forest.get(&plan_id)
+                            {
+                                accumulated_steps.extend(tree_meta.steps.clone());
+                                if !tree_meta.description.is_empty() {
+                                    accumulated_descriptions
+                                        .push(tree_meta.description.clone());
                                 }
                             }
                             forest.remove(&plan_id);
@@ -1465,6 +1546,7 @@ pub async fn run_turn(
                         continue;
                     }
                     Ok(Err(error)) => {
+                        flush_on_exit!();
                         return Err(anyhow::anyhow!("VLM stream error: {error:#}"));
                     }
                     Err(_) if vlm_attempt == 0 => {
@@ -1472,7 +1554,10 @@ pub async fn run_turn(
                         vlm_attempt += 1;
                         continue;
                     }
-                    Err(_) => return Err(anyhow::anyhow!("VLM stream open timed out")),
+                    Err(_) => {
+                        flush_on_exit!();
+                        return Err(anyhow::anyhow!("VLM stream open timed out"));
+                    }
                 };
                 let mut full_text = String::new();
                 let mut tool_calls: Vec<crate::vlm::ToolCall> = Vec::new();
@@ -1483,6 +1568,13 @@ pub async fn run_turn(
                         // Cancel takes priority — checked before every new VLM token.
                         _ = cancel_rx.changed() => {
                             drop(stream);
+                            flush_accumulated_plan(
+                                &mut accumulated_steps,
+                                &mut accumulated_descriptions,
+                                &remember_memory_target,
+                                    standing_task.as_ref().map(|s| s.goal.as_str()).unwrap_or(""),
+                                    executor.graph.clone(),
+                                );
                             return_interrupted!(&forest);
                         }
                         steer = steer_rx.recv() => {
@@ -1541,6 +1633,7 @@ pub async fn run_turn(
                         vlm_attempt += 1;
                         continue;
                     }
+                    flush_on_exit!();
                     return Err(error);
                 }
 
@@ -1701,6 +1794,7 @@ pub async fn run_turn(
             if !assistant_content.is_empty() {
                 history.push(Message::assistant(&assistant_content));
             }
+            flush_on_exit!();
             let _ = tx
                 .send(Ok(service::pack(
                     &session_id,
@@ -1883,6 +1977,7 @@ pub async fn run_turn(
                 if hit_cap && !(task_done || standing_task.is_none()) {
                     warn!("[pilot] hit max tool rounds ({max_rounds}), stopping turn");
                 }
+                flush_on_exit!();
                 let reply = if assistant_content.trim().is_empty() && !task_done {
                     "I need more information before I can continue.".to_string()
                 } else {
@@ -1925,6 +2020,7 @@ pub async fn run_turn(
             }
             if hit_cap {
                 warn!("[pilot] hit max tool rounds ({max_rounds}), stopping turn");
+                flush_on_exit!();
                 break;
             }
             // should_plan stays false: wait for a forest event, or for a steer
@@ -1973,12 +2069,18 @@ pub async fn run_turn(
 
         if hit_cap {
             warn!("[pilot] hit max tool rounds ({max_rounds}), stopping turn");
+            flush_on_exit!();
             break;
         }
         // should_plan stays false: wait for this tree (and any others) to report.
     }
 
     // ── 8. Mark turn complete ─────────────────────────────────────────────────
+    // Flush any remaining accumulated steps before finalizing the turn.
+    // This catches edge cases where the turn exits without hitting the
+    // explicit flush points (e.g. VLM timeout after some trees succeeded).
+    flush_on_exit!();
+
     let _ = tx
         .send(Ok(service::pack(
             &session_id,

@@ -34,6 +34,7 @@ rust/provider/
 rbnx-boot
 tmp*
 .libero/
+Scribe/maps
 
 # memory service
 agent_milvus.db*
@@ -68,3 +69,6 @@ env.sh
 develop_specs/
 
 *.egg-info/
+
+# Local Webots installer package
+examples/webots/sim/*.deb

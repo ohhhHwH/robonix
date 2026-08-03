@@ -985,12 +985,11 @@ fn flush_accumulated_plan(
         memory::save_plan(
             executor_graph,
             target.clone(),
-            String::new(),
             user_goal.to_string(),
             plan_desc,
             steps,
             n_trees,
-            0, // canceled_count: tracked per-tree, not accumulated here
+            0, // canceled_count
         );
     }
 }
@@ -1063,14 +1062,37 @@ pub async fn run_turn(
     // rename it freely. contract_id is the stable identity.
     let search_memory_target = initial_caps
         .iter()
-        .find(|(_, cap)| cap.contract_id == "robonix/service/memory/hybrid_search")
+        .find(|(_, cap)| cap.contract_id == "robonix/service/memory/ptdl_retrieve")
         .map(|(provider_id, cap)| (provider_id.clone(), cap.contract_id.clone()));
 
-    // Also discover the remember capability for saving successful plans later.
+    // Also discover the ptdl_remember capability for saving successful plans.
     let remember_memory_target = initial_caps
         .iter()
-        .find(|(_, cap)| cap.contract_id == "robonix/service/memory/remember")
+        .find(|(_, cap)| cap.contract_id == "robonix/service/memory/ptdl_remember")
         .map(|(provider_id, cap)| (provider_id.clone(), cap.contract_id.clone()));
+    debug!(
+        "[pilot] ptdl_remember target: {}",
+        remember_memory_target
+            .as_ref()
+            .map(|(pid, cid)| format!("{}/{}", pid, cid))
+            .unwrap_or_else(|| "NOT FOUND".to_string())
+    );
+    // guaranteed debug: append to file
+    let _ = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("/tmp/pilot_ptdl_debug.log")
+        .and_then(|mut f| {
+            use std::io::Write;
+            writeln!(
+                f,
+                "DISCOVERY: ptdl_remember={}",
+                remember_memory_target
+                    .as_ref()
+                    .map(|(p, c)| format!("{p}/{c}"))
+                    .unwrap_or_else(|| "NONE".to_string()),
+            )
+        });
 
     // 1b. Pre-fetch long-term memory
     // Silently dispatches search_memory before the first VLM call so that
@@ -1368,6 +1390,24 @@ pub async fn run_turn(
                                 && !canceled
                                 && let Some(tree_meta) = forest.get(&plan_id)
                             {
+                                let _ = std::fs::OpenOptions::new()
+                                    .create(true).append(true)
+                                    .open("/tmp/pilot_ptdl_debug.log")
+                                    .and_then(|mut f| {
+                                        use std::io::Write;
+                                        let user_goal = standing_task
+                                            .as_ref()
+                                            .map(|s| s.goal.clone())
+                                            .unwrap_or_default();
+                                        writeln!(
+                                            f,
+                                            "PlanDone SUCCESS: plan_id={plan_id} steps={n} \
+                                             user_goal=\"{goal}\" target={has_target}",
+                                            n = tree_meta.steps.len(),
+                                            goal = user_goal,
+                                            has_target = remember_memory_target.is_some(),
+                                        )
+                                    });
                                 // Accumulate for end-of-turn merged flush
                                 accumulated_steps.extend(tree_meta.steps.clone());
                                 if !tree_meta.description.is_empty() {
@@ -1392,7 +1432,6 @@ pub async fn run_turn(
                                         memory::save_plan(
                                             executor.graph.clone(),
                                             target.clone(),
-                                            plan_id.clone(),
                                             user_goal.clone(),
                                             desc,
                                             tree_meta.steps.clone(),
@@ -1401,6 +1440,67 @@ pub async fn run_turn(
                                         );
                                     }
                                 }
+                            } else if (any_failed || canceled)
+                                && let Some(tree_meta) = forest.get(&plan_id)
+                            {
+                                // ── Save failed / canceled trees for debugging ──
+                                let _ = std::fs::OpenOptions::new()
+                                    .create(true).append(true)
+                                    .open("/tmp/pilot_ptdl_debug.log")
+                                    .and_then(|mut f| {
+                                        use std::io::Write;
+                                        writeln!(
+                                            f,
+                                            "PlanDone FAILED: plan_id={plan_id} any_failed={any_failed} \
+                                             canceled={canceled} steps={n} desc={desc}",
+                                            n = tree_meta.steps.len(),
+                                            desc = tree_meta.description,
+                                        )
+                                    });
+                                if let Some(ref target) = remember_memory_target {
+                                    debug!(
+                                        "[pilot] saving failed plan to ptdl: target={}/{}",
+                                        target.0, target.1,
+                                    );
+                                    let user_goal = standing_task
+                                        .as_ref()
+                                        .map(|s| s.goal.clone())
+                                        .unwrap_or_default();
+                                    if !user_goal.is_empty()
+                                        && !tree_meta.steps.is_empty()
+                                    {
+                                        let desc = if tree_meta.description.is_empty() {
+                                            format!("plan_id={}", plan_id)
+                                        } else {
+                                            format!(
+                                                "{} (FAILED{})",
+                                                tree_meta.description,
+                                                if canceled { ",canceled" } else { "" },
+                                            )
+                                        };
+                                        memory::save_plan(
+                                            executor.graph.clone(),
+                                            target.clone(),
+                                            user_goal.clone(),
+                                            desc,
+                                            tree_meta.steps.clone(),
+                                            1, // single tree
+                                            if canceled { 1 } else { 0 },
+                                        );
+                                    }
+                                }
+                            } else if any_failed || canceled {
+                                let _ = std::fs::OpenOptions::new()
+                                    .create(true).append(true)
+                                    .open("/tmp/pilot_ptdl_debug.log")
+                                    .and_then(|mut f| {
+                                        use std::io::Write;
+                                        writeln!(
+                                            f,
+                                            "PlanDone FAILED but forest MISSING: plan_id={plan_id} \
+                                             any_failed={any_failed} canceled={canceled}",
+                                        )
+                                    });
                             }
                             forest.remove(&plan_id);
                             let requested_cancellation = cancel_requested.remove(&plan_id);

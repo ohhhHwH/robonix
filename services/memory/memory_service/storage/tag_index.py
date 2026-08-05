@@ -124,6 +124,10 @@ class TagIndex:
             self._node_tags[node.node_id] = node.tags
             self._index_tags(node.node_id, node.tags)
 
+    def clear(self) -> None:
+        """Remove all indexed entries."""
+        self.rebuild([])
+
     def count(self) -> int:
         """Number of indexed nodes."""
         return len(self._all_ids)

@@ -398,3 +398,7 @@ class VectorStore:
             if emb:
                 self._vectors[nid] = np.array(emb, dtype=np.float32)
         self._bm25.rebuild([(nid, summary) for nid, _, summary in nodes])
+
+    def clear(self) -> None:
+        """Remove all entries from both dense and BM25 indices."""
+        self.rebuild([])

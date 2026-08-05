@@ -89,6 +89,7 @@ MEMORY_DIR = str(
 # Set MEMGRAPH_KEEP_DATA=1 to opt out (e.g. debugging persistence bugs).
 _KEEP_DATA = os.environ.get("MEMGRAPH_KEEP_DATA", "0") in ("1", "true", "yes")
 
+
 def _clean_slate() -> None:
     """Delete graph_store.json and all image directories from prior runs."""
     import shutil
@@ -112,6 +113,7 @@ def _clean_slate() -> None:
                 log.debug("scribe_mem: clean_images: %s: %s", entry, e)
         if count:
             log.info("scribe_mem: cleaned %d entries from %s", count, images_dir)
+
 
 if not _KEEP_DATA:
     _clean_slate()

@@ -133,6 +133,15 @@ class GraphStore:
         """Return all node IDs."""
         return list(self._nodes.keys())
 
+    def clear(self) -> None:
+        """Remove all nodes, edges and reset ID counters. Persists immediately."""
+        self._nodes.clear()
+        self._children.clear()
+        self._parents.clear()
+        self._next_short_term_id = 0
+        self._next_long_term_id = 1000
+        self._persist()
+
     # ── Causal edges ───────────────────────────────────────────────────
 
     def add_edge(self, parent_id: int, child_id: int) -> None:

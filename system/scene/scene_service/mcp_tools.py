@@ -448,9 +448,9 @@ async def get_robot_context(_req: GetRobotContext_Request) -> GetRobotContext_Re
 
 
 # Constants for goal_near — service-side defaults, no longer schema knobs.
-_GOAL_NEAR_CLEARANCE_M = 0.4   # robot inscribed_radius + safety margin
+_GOAL_NEAR_CLEARANCE_M = 0.2   # robot inscribed_radius + safety margin
 _GOAL_NEAR_SEARCH_M = 6.0      # max distance to look for a free cell
-_GOAL_NEAR_ROBOT_RADIUS_M = 0.3  # Tiago-sized default for inflation
+_GOAL_NEAR_ROBOT_RADIUS_M = 0.15  # Tiago-sized default for inflation
 _GOAL_NEAR_RING_STEP_M = 0.1
 _GOAL_NEAR_ANGLE_STEPS = [0.0, 0.2, -0.2, 0.4, -0.4, 0.6, -0.6,
                           0.8, -0.8, 1.0, -1.0, 1.2, -1.2,

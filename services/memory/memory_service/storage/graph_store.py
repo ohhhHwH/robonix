@@ -149,6 +149,16 @@ class GraphStore:
         return True
 
     @_locked
+    def clear_all(self) -> None:
+        """Remove all nodes, edges, and reset ID counters."""
+        self._nodes.clear()
+        self._children.clear()
+        self._parents.clear()
+        self._next_short_term_id = 0
+        self._next_long_term_id = 1000
+        self._persist()
+
+    @_locked
     def count(self) -> int:
         """Total number of nodes."""
         return len(self._nodes)

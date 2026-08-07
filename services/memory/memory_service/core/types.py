@@ -150,6 +150,44 @@ class LogRecord:
 
 
 @dataclass
+class CameraParams:
+    """Camera intrinsics and extrinsics at observation time. (§I)"""
+    fx: float = 0.0
+    fy: float = 0.0
+    cx: float = 0.0
+    cy: float = 0.0
+    width: int = 0
+    height: int = 0
+    camera_pose: Optional["ObjectCoord"] = None  # world-frame camera position
+    depth_scale: float = 1.0
+    camera_type: str = "rgb"        # rgb | depth | thermal
+
+    def to_dict(self) -> Dict[str, Any]:
+        d: Dict[str, Any] = {
+            "fx": self.fx, "fy": self.fy, "cx": self.cx, "cy": self.cy,
+            "width": self.width, "height": self.height,
+            "depth_scale": self.depth_scale, "camera_type": self.camera_type,
+        }
+        if self.camera_pose is not None:
+            d["camera_pose"] = self.camera_pose.to_dict()
+        return d
+
+    @classmethod
+    def from_dict(cls, d: Dict[str, Any]) -> "CameraParams":
+        pose = None
+        if d.get("camera_pose"):
+            pose = ObjectCoord.from_dict(d["camera_pose"])
+        return cls(
+            fx=float(d.get("fx", 0)), fy=float(d.get("fy", 0)),
+            cx=float(d.get("cx", 0)), cy=float(d.get("cy", 0)),
+            width=int(d.get("width", 0)), height=int(d.get("height", 0)),
+            camera_pose=pose,
+            depth_scale=float(d.get("depth_scale", 1.0)),
+            camera_type=str(d.get("camera_type", "rgb")),
+        )
+
+
+@dataclass
 class MemoryNode:
     """CKG basic unit — one event the robot experienced. (§2.1)"""
     # Identity
@@ -161,6 +199,7 @@ class MemoryNode:
 
     # Spatiotemporal
     timestamp: int = 0              # chronos ns
+    time_range: Optional[TimeRange] = None
     spatial_data: Optional[SpatialContext] = None
 
     # Tags (4-dim)
@@ -175,8 +214,16 @@ class MemoryNode:
     # Embedding (Phase1: text-only, d=384 from all-MiniLM-L6-v2)
     embedding: List[float] = field(default_factory=list)
 
-    # Images (patrol / inspection demo)
+    # Images + depth (patrol / inspection demo)
     image_refs: List[str] = field(default_factory=list)  # paths relative to data/
+    depth_refs: List[str] = field(default_factory=list)
+    frame_ts: List[int] = field(default_factory=list)     # ns timestamps per frame
+
+    # Video clips
+    video_clip_refs: List[str] = field(default_factory=list)
+
+    # Camera parameters at observation time
+    camera_params: Optional[CameraParams] = None
 
     # Metadata
     node_type: NodeType = NodeType.SHORT_TERM
@@ -191,6 +238,7 @@ class MemoryNode:
         d["summary"] = self.summary
         d["raw_log"] = self.raw_log.to_dict() if self.raw_log else None
         d["timestamp"] = self.timestamp
+        d["time_range"] = self.time_range.to_dict() if self.time_range else None
         d["spatial_data"] = self.spatial_data.to_dict() if self.spatial_data else None
         d["tags"] = self.tags.to_dict() if self.tags else None
         d["causal_chain"] = list(self.causal_chain)
@@ -202,6 +250,10 @@ class MemoryNode:
         d["access_count"] = self.access_count
         d["version"] = self.version
         d["image_refs"] = list(self.image_refs)
+        d["depth_refs"] = list(self.depth_refs)
+        d["frame_ts"] = list(self.frame_ts)
+        d["video_clip_refs"] = list(self.video_clip_refs)
+        d["camera_params"] = self.camera_params.to_dict() if self.camera_params else None
         return d
 
     @classmethod
@@ -210,11 +262,14 @@ class MemoryNode:
         spatial = SpatialContext.from_dict(d["spatial_data"]) if d.get("spatial_data") else None
         tags = TagSet.from_dict(d["tags"]) if d.get("tags") else None
         node_type = NodeType(d.get("node_type", "short_term"))
+        time_range = TimeRange.from_dict(d["time_range"]) if d.get("time_range") else None
+        camera_params = CameraParams.from_dict(d["camera_params"]) if d.get("camera_params") else None
         return cls(
             node_id=d.get("node_id", 0),
             summary=d.get("summary", ""),
             raw_log=raw_log,
             timestamp=d.get("timestamp", 0),
+            time_range=time_range,
             spatial_data=spatial,
             tags=tags,
             causal_chain=d.get("causal_chain", []),
@@ -226,6 +281,10 @@ class MemoryNode:
             access_count=d.get("access_count", 0),
             version=d.get("version", 1),
             image_refs=d.get("image_refs", []),
+            depth_refs=d.get("depth_refs", []),
+            frame_ts=d.get("frame_ts", []),
+            video_clip_refs=d.get("video_clip_refs", []),
+            camera_params=camera_params,
         )
 
 
@@ -251,6 +310,14 @@ class TimeRange:
     """Time range filter for search/history queries."""
     start_ts: int = 0
     end_ts: int = 0                 # 0 = no upper bound (use current time)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {"start_ts": self.start_ts, "end_ts": self.end_ts}
+
+    @classmethod
+    def from_dict(cls, d: Dict[str, Any]) -> "TimeRange":
+        return cls(start_ts=int(d.get("start_ts", 0)),
+                   end_ts=int(d.get("end_ts", 0)))
 
 
 @dataclass
@@ -336,6 +403,9 @@ class RememberRequest:
     spatial: Optional[SpatialContext] = None
     parent_node_id: Optional[int] = None
     image_base64: str = ""           # top-level: camera frame as base64
+    depth_base64: str = ""           # top-level: depth frame as base64
+    camera_params: Optional[CameraParams] = None
+    time_range: Optional[TimeRange] = None
     kv: Dict[str, str] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
@@ -346,18 +416,27 @@ class RememberRequest:
             "spatial": self.spatial.to_dict() if self.spatial else None,
             "parent_node_id": self.parent_node_id,
             "image_base64": self.image_base64,
+            "depth_base64": self.depth_base64,
+            "camera_params": self.camera_params.to_dict() if self.camera_params else None,
+            "time_range": self.time_range.to_dict() if self.time_range else None,
             "kv": self.kv,
         }
 
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> "RememberRequest":
         spatial = SpatialContext.from_dict(d["spatial"]) if d.get("spatial") else None
+        camera_params = CameraParams.from_dict(d["camera_params"]) if d.get("camera_params") else None
+        time_range = TimeRange.from_dict(d["time_range"]) if d.get("time_range") else None
         return cls(
             session_id=d.get("session_id", ""),
             plan_id=d.get("plan_id", ""),
             log_record=LogRecord.from_dict(d.get("log_record", {})),
             spatial=spatial,
             parent_node_id=d.get("parent_node_id"),
+            image_base64=d.get("image_base64", ""),
+            depth_base64=d.get("depth_base64", ""),
+            camera_params=camera_params,
+            time_range=time_range,
             kv=d.get("kv", {}),
         )
 
@@ -397,10 +476,7 @@ class SearchRequest:
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> "SearchRequest":
         tags = TagFilter.from_dict(d["tags"]) if d.get("tags") else None
-        tr = None
-        if d.get("time_range"):
-            tr = TimeRange(start_ts=d["time_range"].get("start_ts", 0),
-                           end_ts=d["time_range"].get("end_ts", 0))
+        tr = TimeRange.from_dict(d["time_range"]) if d.get("time_range") else None
         return cls(
             query=d.get("query", ""),
             tags=tags,

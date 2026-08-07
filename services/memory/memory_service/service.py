@@ -774,10 +774,11 @@ def _start_scene_hook_server() -> None:
                 return
 
             has_img = "yes" if data.get("image_base64") else "no"
+            has_depth = "yes" if data.get("depth_base64") else "no"
             n_objs = len(data.get("spatial", {}).get("objects", []))
-            b64_len = len(data.get("image_base64", ""))
-            log.info("scene_hook.http: received — has_image=%s objects=%d b64len=%d body=%dB",
-                     has_img, n_objs, b64_len, length)
+            has_cam = "yes" if data.get("camera_params") else "no"
+            log.info("scene_hook.http: received — has_image=%s has_depth=%s objects=%d has_camera=%s body=%dB",
+                     has_img, has_depth, n_objs, has_cam, length)
 
             # Run the remember pipeline synchronously in this thread.
             import asyncio as _asyncio
@@ -794,14 +795,39 @@ def _start_scene_hook_server() -> None:
                     self._reply(200, {"node_id": existing_nid})
                     return
 
+                # Parse camera_params if provided (scenes2 dataset fields)
+                camera_params = None
+                if data.get("camera_params"):
+                    camera_params = CameraParams.from_dict(data["camera_params"])
+
+                # Parse time_range if provided
+                time_range = None
+                if data.get("time_range"):
+                    time_range = TimeRange.from_dict(data["time_range"])
+
                 req = RememberRequest(
                     session_id=data.get("session_id", "scene-hook"),
                     plan_id=data.get("plan_id", "scene-hook"),
                     log_record=lr,
                     spatial=spatial,
                     image_base64=data.get("image_base64", ""),
+                    depth_base64=data.get("depth_base64", ""),
+                    camera_params=camera_params,
+                    time_range=time_range,
                     kv=data.get("kv") if isinstance(data.get("kv"), dict) else {},
                 )
+                t_pipe = time.time()
+                resp = _asyncio.run(_remember_pipe.execute(req))
+                pipe_ms = (time.time() - t_pipe) * 1000
+                total_ms = (time.time() - t0) * 1000
+                log.info("scene_hook.http: → node %d (pipe %dms, total %dms)",
+                         resp.node_id, round(pipe_ms), round(total_ms))
+                self._reply(200, {"node_id": resp.node_id})
+            except Exception as e:
+                total_ms = (time.time() - t0) * 1000
+                log.warning("scene_hook.http: ! pipeline error after %dms: %s: %s",
+                           round(total_ms), type(e).__name__, e)
+                self._reply(500, {"error": str(e)})
                 t_pipe = time.time()
                 resp = _asyncio.run(_remember_pipe.execute(req))
                 pipe_ms = (time.time() - t_pipe) * 1000

@@ -124,13 +124,18 @@ async def call_llm(
             {"role": "user", "content": "Generate the QA pairs now."},
         ],
         "temperature": 0.7,
-        "max_tokens": 4096,
+        "max_tokens": 16384,
     }).encode()
     req = urllib.request.Request(f"{url}/chat/completions", data=payload, headers=headers)
     try:
-        resp = urllib.request.urlopen(req, timeout=120)
+        resp = urllib.request.urlopen(req, timeout=180)
         data = json.loads(resp.read())
-        return data["choices"][0]["message"]["content"]
+        content = data["choices"][0]["message"]["content"]
+        if content is None:
+            finish = data["choices"][0].get("finish_reason", "?")
+            print(f"  LLM returned null content (finish_reason={finish})")
+            return None
+        return content
     except Exception as e:
         print(f"  LLM error: {e}")
         return None
@@ -138,21 +143,51 @@ async def call_llm(
 
 def extract_json(text: str) -> Optional[List[Dict]]:
     """Extract JSON array from LLM output that may contain markdown fences."""
+    if not text or not text.strip():
+        return None
     text = text.strip()
     # Remove markdown fences
     if text.startswith("```"):
         text = re.sub(r"^```\w*\n?", "", text)
         text = re.sub(r"\n?```$", "", text)
+    # Try direct parse first
     try:
         return json.loads(text)
     except json.JSONDecodeError:
-        # Try to find JSON array between [ and ]
-        m = re.search(r'\[.*\]', text, re.DOTALL)
-        if m:
-            try:
-                return json.loads(m.group())
-            except json.JSONDecodeError:
-                pass
+        pass
+    # Try to find JSON array between [ and ]
+    m = re.search(r'\[.*\]', text, re.DOTALL)
+    if m:
+        try:
+            return json.loads(m.group())
+        except json.JSONDecodeError:
+            pass
+    # Try to recover truncated JSON: close open brackets
+    if text.strip().startswith('['):
+        # Count brackets and close them
+        open_braces = text.count('{') - text.count('}')
+        open_brackets = text.count('[') - text.count(']')
+        if open_braces > 0 or open_brackets > 0:
+            # Truncated — try to close the last complete object
+            # Remove the last incomplete object
+            last_complete = text.rfind('},')
+            if last_complete > 0:
+                recovered = text[:last_complete+1] + '\n]'
+                try:
+                    return json.loads(recovered)
+                except json.JSONDecodeError:
+                    pass
+            # Try last complete object without comma
+            last_brace = text.rfind('}')
+            if last_brace > 0:
+                recovered = text[:last_brace+1] + '\n]'
+                try:
+                    result = json.loads(recovered)
+                    if isinstance(result, list) and len(result) > 0:
+                        print(f"  Recovered {len(result)} QA pairs from truncated JSON")
+                        return result
+                except json.JSONDecodeError:
+                    pass
     return None
 
 
@@ -200,7 +235,10 @@ async def main() -> None:
     total = 0
     difficulty_counts: Dict[str, Dict[str, int]] = {}
 
-    for cat in CATEGORIES:
+    for i, cat in enumerate(CATEGORIES):
+        if i > 0:
+            print(f"  (waiting 3s before next category...)")
+            await asyncio.sleep(3)
         prefix = CATEGORY_PREFIX[cat]
         pairs = await generate_category(args, nodes, cat, prefix)
         all_qa[cat] = pairs

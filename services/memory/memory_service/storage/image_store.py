@@ -49,6 +49,23 @@ class ImageStore:
 
     # ── Write ──────────────────────────────────────────────────────────
 
+    def save_depth(self, node_id: int, depth_bytes: bytes) -> str:
+        """Save one depth frame (16-bit PNG) for a node. Returns the relative path."""
+        node_dir = self._node_dir(node_id)
+        node_dir.mkdir(parents=True, exist_ok=True)
+
+        existing = sorted(node_dir.glob("depth_*.png"))
+        seq = len(existing) + 1
+        filename = f"depth_{seq:04d}.png"
+        filepath = node_dir / filename
+
+        with open(filepath, "wb") as f:
+            f.write(depth_bytes)
+
+        rel = str(filepath.relative_to(self._root.parent.parent))
+        log.info("image_store: wrote depth %s (%.1f KB)", rel, len(depth_bytes) / 1024)
+        return rel
+
     def save(self, node_id: int, image_bytes: bytes) -> str:
         """Save one image frame for a node.  Returns the relative path.
 

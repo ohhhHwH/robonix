@@ -323,6 +323,7 @@ class RememberPipeline:
             summary=summary,
             raw_log=log_record,
             timestamp=log_record.ts or now,
+            time_range=request.time_range,
             spatial_data=spatial,
             tags=tags,
             weight=weight,
@@ -330,6 +331,7 @@ class RememberPipeline:
             node_type=node_type,
             created_at=now,
             version=1,
+            camera_params=request.camera_params,
         )
 
         # 4. Persist to GraphStore first to get node_id
@@ -360,6 +362,33 @@ class RememberPipeline:
                 img_ms = (time.time() - t_img) * 1000
                 log.warning("remember: node %d image save FAILED after %dms: %s: %s",
                            node_id, round(img_ms), type(e).__name__, e)
+
+        # 5b. Save depth frame if provided
+        depth_b64 = request.depth_base64 or request.kv.get("depth_base64", "")
+        if self._images and depth_b64:
+            import base64 as _b64
+            try:
+                depth_bytes = _b64.b64decode(depth_b64)
+                saved_path = self._images.save_depth(node_id, depth_bytes)
+                node.depth_refs = [saved_path]
+                self._graph.update_node(node_id, node)
+                log.info("remember: node %d → saved depth %s (%.1f KB)",
+                         node_id, saved_path, len(depth_bytes) / 1024)
+            except Exception as e:
+                log.warning("remember: node %d depth save FAILED: %s", node_id, e)
+
+        # 5c. Record frame timestamps from kv
+        frame_ts_str = request.kv.get("frame_ts", "")
+        if frame_ts_str:
+            try:
+                node.frame_ts = [int(x.strip()) for x in frame_ts_str.split(",") if x.strip()]
+            except (ValueError, TypeError):
+                pass
+
+        # 5d. Record video clip refs from kv
+        video_clip = request.kv.get("video_clip_refs", "")
+        if video_clip:
+            node.video_clip_refs = [v.strip() for v in video_clip.split(",") if v.strip()]
 
         # 6. Tags first into inverted index
         self._tags.insert(node_id, tags)

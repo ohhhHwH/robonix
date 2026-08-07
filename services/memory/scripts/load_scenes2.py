@@ -149,15 +149,30 @@ async def main() -> None:
             first_ts = ts
         last_ts = ts
 
-        # Build spatial context from camera pose
-        spatial = SpatialContext(
-            origin="world",
-            objects=[ObjectCoord(
-                obj_id=f"cam_frame_{fid:06d}",
-                label="camera_frame",
-                x=fm["cam_x"], y=fm["cam_y"], z=fm["cam_z"],
-            )],
-        )
+        # Build spatial context: camera pose + matched objects
+        spatial_objects = [ObjectCoord(
+            obj_id=f"cam_frame_{fid:06d}",
+            label="camera_frame",
+            x=fm["cam_x"], y=fm["cam_y"], z=fm["cam_z"],
+        )]
+        # Match objects from objects.yaml to this frame via timestamp
+        for obj_id, obj in objects_gt.items():
+            first_ts = obj.get("first_seen_ts", 0)
+            last_ts = obj.get("last_seen_ts", 0)
+            # ts=0 means "visible throughout" (no temporal filtering)
+            if first_ts == 0 and last_ts == 0:
+                in_range = True
+            else:
+                in_range = (first_ts <= ts <= last_ts) if last_ts > 0 else (ts >= first_ts)
+            if in_range:
+                pos = obj.get("position", {})
+                spatial_objects.append(ObjectCoord(
+                    obj_id=obj_id,
+                    label=obj.get("label_en", obj.get("label_zh", "unknown")),
+                    x=float(pos.get("x", 0)),
+                    y=float(pos.get("y", 0)),
+                    z=float(pos.get("z", 0)),
+                ))
 
         # Read image file as base64 (or use placeholder for speed)
         img_path = session_dir / fm["image_path"]
@@ -172,12 +187,21 @@ async def main() -> None:
             if dp.exists():
                 depth_b64 = base64.b64encode(dp.read_bytes()).decode()
 
+        # Build object label summary for kv
+        obj_labels = list(set(o.label for o in spatial_objects if o.label != "camera_frame"))
+        objects_str = ", ".join(sorted(obj_labels)[:30])
+
+        spatial = SpatialContext(
+            origin="world",
+            objects=spatial_objects,
+        )
+
         req = RememberRequest(
             session_id=f"scenes2-{session_dir.name}",
             plan_id=f"load-frame-{fid:06d}",
             log_record=LogRecord(
                 ts=ts, level="Info", tag="scenes2",
-                msg=f"loaded frame {fid:06d}",
+                msg=f"loaded frame {fid:06d} with {len(spatial_objects)-1} objects: [{objects_str}]",
             ),
             spatial=spatial,
             image_base64=img_b64,
@@ -187,6 +211,7 @@ async def main() -> None:
             kv={
                 "frame_ts": str(ts),
                 "video_clip_refs": "",
+                "objects": objects_str,
             },
         )
         try:

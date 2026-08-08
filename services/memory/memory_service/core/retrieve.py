@@ -20,7 +20,10 @@ from __future__ import annotations
 import json as _json
 import logging
 import os
+import subprocess
+import tempfile
 import time
+from pathlib import Path
 from typing import List, Optional, Set
 
 from ..storage.graph_store import GraphStore
@@ -30,6 +33,107 @@ from . import llm_search
 from .types import (
     MemoryNode, SearchRequest, SearchResponse, TagFilter,
 )
+
+
+def _extract_video_keyframes(
+    video_refs: List[str],
+    time_range=None,
+    max_frames: int = 3,
+    data_dir: str = "",
+) -> List[str]:
+    """Extract keyframes from video files using ffmpeg.
+
+    Args:
+        video_refs: Relative video paths (e.g. "videos/rgb_main.mp4")
+        time_range: Optional TimeRange to seek to a specific segment.
+        max_frames: Maximum number of frames to extract per video.
+        data_dir: Base directory for resolving relative video paths.
+
+    Returns:
+        List of absolute paths to extracted PNG frames (temporary files).
+    """
+    extracted: List[str] = []
+    # Find ffmpeg binary
+    ffmpeg = _find_ffmpeg()
+    if ffmpeg is None:
+        return extracted
+
+    for vref in video_refs[:2]:  # Max 2 video files
+        # Resolve path
+        video_path = Path(vref)
+        if not video_path.is_absolute() and data_dir:
+            # Try session directory relative paths
+            candidates = [
+                Path(data_dir) / vref,
+                Path(data_dir).parent / vref,  # data_dir is memory dir, videos are in session dir
+            ]
+            for c in candidates:
+                if c.exists():
+                    video_path = c
+                    break
+
+        if not video_path.exists():
+            logging.getLogger("scribe_mem").warning(
+                "retrieve: video not found: %s", vref
+            )
+            continue
+
+        # Build ffmpeg command
+        tmpdir = tempfile.mkdtemp(prefix="rbnx_vframes_")
+        seek_offset = ""
+        if time_range is not None:
+            start_ts = getattr(time_range, "start_ts", 0)
+            # Convert nanosecond timestamp to seconds from video start
+            seek_s = 0.0  # Default: from beginning
+            if start_ts > 0:
+                # Timestamp is absolute; extract relative offset from filename or use 0
+                seek_s = 0.0
+            if seek_s > 0:
+                seek_offset = str(seek_s)
+
+        # ffmpeg: seek to position, extract N frames as PNG
+        cmd = [
+            ffmpeg, "-y", "-loglevel", "error",
+        ]
+        if seek_offset:
+            cmd.extend(["-ss", seek_offset])
+        cmd.extend([
+            "-i", str(video_path),
+            "-vframes", str(max_frames),
+            "-vf", "fps=1/3",  # 1 frame every 3 seconds (sparse sampling)
+            f"{tmpdir}/vframe_%03d.png",
+        ])
+
+        try:
+            result = subprocess.run(cmd, capture_output=True, timeout=30)
+            if result.returncode == 0:
+                for p in sorted(Path(tmpdir).glob("vframe_*.png")):
+                    extracted.append(str(p))
+            else:
+                stderr = result.stderr.decode(errors="replace")[:200]
+                logging.getLogger("scribe_mem").warning(
+                    "retrieve: ffmpeg failed for %s: %s", vref, stderr
+                )
+        except (subprocess.TimeoutExpired, FileNotFoundError, OSError) as e:
+            logging.getLogger("scribe_mem").warning(
+                "retrieve: ffmpeg error for %s: %s", vref, e
+            )
+
+    return extracted
+
+
+def _find_ffmpeg() -> Optional[str]:
+    """Locate ffmpeg binary on the system."""
+    for candidate in ("ffmpeg", "/usr/bin/ffmpeg", "/usr/local/bin/ffmpeg"):
+        try:
+            result = subprocess.run(
+                [candidate, "-version"], capture_output=True, timeout=5,
+            )
+            if result.returncode == 0:
+                return candidate
+        except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+            continue
+    return None
 
 log = logging.getLogger("scribe_mem")
 
@@ -114,12 +218,14 @@ class RetrievePipeline:
 
     def __init__(self, graph_store: GraphStore, tag_index: TagIndex,
                  vector_store: VectorStore,
-                 vlm_extractor=None,  # VLMFeatureExtractor or None
+                 vlm_extractor=None,   # VLMFeatureExtractor or None
+                 data_dir: str = "",
                  ):
         self._graph = graph_store
         self._tags = tag_index
         self._vectors = vector_store  # kept for optional embedding path
         self._vlm_extractor = vlm_extractor
+        self._data_dir = data_dir
 
     async def execute(self, request: SearchRequest) -> SearchResponse:
         """Execute the search pipeline: Tier1 text index -> Tier2 rank -> filters.
@@ -359,6 +465,20 @@ class RetrievePipeline:
                 node_ctx.append(" | ".join(parts))
                 if n.image_refs:
                     all_image_refs.extend(n.image_refs)
+                # Stage 6a: Fallback to video keyframe extraction
+                if not n.image_refs and n.video_clip_refs:
+                    vframes = _extract_video_keyframes(
+                        video_refs=n.video_clip_refs,
+                        time_range=n.time_range,
+                        max_frames=3,
+                        data_dir=self._data_dir,
+                    )
+                    if vframes:
+                        all_image_refs.extend(vframes)
+                        log.info(
+                            "search: extracted %d keyframes from %d video(s) for node %d",
+                            len(vframes), len(n.video_clip_refs), n.node_id,
+                        )
 
             if all_image_refs or node_ctx:
                 # -- LLM decides: can we answer from text alone? --

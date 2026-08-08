@@ -256,10 +256,12 @@ class MemoryService:
         return await self._remember_pipe.execute(req)
 
     async def search(self, query: str, tags=None, top_k: int = 5,
-                     alpha=None, time_range=None, require_executable: bool = False):
+                     alpha=None, time_range=None, require_executable: bool = False,
+                     vlm_qa: bool = False):
         req = SearchRequest(
             query=query, tags=tags, top_k=top_k, alpha=alpha,
             time_range=time_range, require_executable=require_executable,
+            vlm_qa=vlm_qa,
         )
         return await self._retrieve_pipe.execute(req)
 

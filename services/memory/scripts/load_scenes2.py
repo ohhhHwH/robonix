@@ -51,12 +51,16 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--data-dir", default="/tmp/scenes2_memory", help="MemoryService data dir")
     p.add_argument("--output", default="memory_nodes.json", help="Output JSON path")
     p.add_argument("--limit", type=int, default=0, help="Max frames to load (0=all)")
-    p.add_argument("--mode", choices=["frame", "video"], default="frame",
-                   help="frame: one node per image (default); video: one node per video clip")
+    p.add_argument("--mode", choices=["frame", "video", "embodied"], default="frame",
+                   help="frame: one node per image (default); video: one node per video clip; "
+                   "embodied: simulate ObjectWatchdog FOV filtering + spatial dedup")
     p.add_argument("--clip-duration-sec", type=float, default=5.0,
                    help="Video mode: seconds per clip segment (default 5.0)")
     p.add_argument("--thumbnail-interval", type=int, default=15,
                    help="Video mode: encode 1 thumbnail image every N frames (0=none)")
+    p.add_argument("--embodied-cooldown-frames", type=int, default=30,
+                   help="Embodied mode: min frames between angle appends for same object "
+                   "(default 30 ≈ 2s at 15fps)")
     return p.parse_args()
 
 
@@ -205,6 +209,95 @@ def match_objects_to_clip(
     return result
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+# Embodied-mode helpers: replicate ObjectWatchdog perception pipeline.
+# See system/scene/scene_service/object_watchdog.py for the reference impl.
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _yaw_from_quat(qx: float, qy: float, qz: float, qw: float) -> float:
+    """Extract yaw angle from quaternion (pure z-rotation assumption)."""
+    import numpy as np
+    return float(2.0 * np.arctan2(float(qz), float(qw)))
+
+
+def _world_to_pixel(
+    obj_x: float, obj_y: float, obj_z: float,
+    cam_x: float, cam_y: float, cam_z: float,
+    cam_yaw: float,
+    camera_params,
+):
+    """Project 3D world point to 2D pixel using pinhole model.
+
+    Matches ObjectWatchdog._project_to_pixel() Path B exactly:
+      1. World-frame delta from camera to object
+      2. Rotate by -yaw → body-frame coordinates
+      3. Body → ROS optical frame (right, down, forward)
+      4. Pinhole projection with camera intrinsics
+
+    Returns:
+        (u, v, depth) or (None, None, None) if behind camera.
+    """
+    import numpy as np
+
+    dwx = obj_x - cam_x
+    dwy = obj_y - cam_y
+    dwz = obj_z - cam_z
+
+    # Rotate by -yaw → body-frame (forward, left, up)
+    cos_y = np.cos(cam_yaw)
+    sin_y = np.sin(cam_yaw)
+    bx = dwx * cos_y + dwy * sin_y   # body x (forward)
+    by = -dwx * sin_y + dwy * cos_y  # body y (left)
+
+    # Body → ROS optical frame: (right, down, forward)
+    ox = -by        # optical x (right)
+    oy = -dwz       # optical y (down)
+    oz_val = bx     # optical z (forward / depth)
+
+    if oz_val < 0.01:
+        return None, None, None
+
+    u = int(camera_params.fx * ox / oz_val + camera_params.cx)
+    v = int(camera_params.fy * oy / oz_val + camera_params.cy)
+    return u, v, oz_val
+
+
+def _is_duplicate_by_class(
+    cls: str,
+    ox: float, oy: float,
+    seen_positions: Dict[str, List[float]],
+    radius: float,
+) -> bool:
+    """Check whether (ox, oy) is within *radius* of any previously-seen
+    position for *cls*, using actual world-frame positions.
+
+    Matches ObjectWatchdog._is_duplicate().
+    """
+    positions = seen_positions.get(cls)
+    if not positions:
+        return False
+    r2 = radius ** 2
+    for i in range(0, len(positions), 2):
+        sx, sy = positions[i], positions[i + 1]
+        if (ox - sx) ** 2 + (oy - sy) ** 2 <= r2:
+            return True
+    return False
+
+
+# ── Dedup radii from ObjectWatchdog._DEDUP_RADII ──
+_EMBODIED_DEDUP_RADII: Dict[str, float] = {
+    "cabinet": 3.0, "shelf": 3.0, "table": 3.0, "desk": 3.0,
+    "couch": 3.0, "sofa": 3.0, "chair": 2.5, "bed": 3.0,
+    "door": 3.0, "window": 3.0, "refrigerator": 3.0,
+    "monitor": 2.0, "tv": 2.0, "picture_frame": 2.0,
+    "lamp": 2.0, "plant": 1.5, "potted_plant": 1.5,
+    "keyboard": 1.5, "mouse": 1.0, "cup": 1.0, "bottle": 1.0,
+    "mug": 1.0, "water_bottle": 1.0,
+}
+_EMBODIED_DEFAULT_RADIUS = 3.0
+_EMBODIED_MAX_IMAGES = 3
+
+
 async def main() -> None:
     args = parse_args()
     session_dir = Path(args.session)
@@ -245,6 +338,9 @@ async def main() -> None:
     if args.mode == "video":
         await _main_video_mode(args, session_dir, frame_map, objects_gt,
                                camera_params, svc)
+    elif args.mode == "embodied":
+        await _main_embodied_mode(args, session_dir, frame_map, objects_gt,
+                                  camera_params, svc)
     else:
         await _main_frame_mode(args, session_dir, frame_map, objects_gt,
                                camera_params, svc)
@@ -452,6 +548,246 @@ async def _main_video_mode(
     elapsed = time.time() - t0
     print(f"\nSaved: {saved}/{len(clips)} clips in {elapsed:.1f}s "
           f"({saved/elapsed:.1f} clips/sec)" if elapsed > 0 else "")
+
+
+async def _main_embodied_mode(
+    args: argparse.Namespace,
+    session_dir: Path,
+    frame_map: Dict[int, Dict[str, Any]],
+    objects_gt: Dict[str, Any],
+    camera_params: CameraParams,
+    svc: MemoryService,
+) -> None:
+    """Embodied mode: simulate ObjectWatchdog perception pipeline.
+
+    For each frame (tick):
+      1. FOV filter: project objects to camera pixel space
+      2. Spatial dedup: same-class objects within DEDUP_RADII → same identity
+      3. New objects → create MemoryNode with current frame image
+      4. Seen objects from new angle → append child node via parent_node_id
+         (max 3 images per object, cooldown between appends).
+
+    This is the closest approximation to how a real robot running
+    ObjectWatchdog would build its memory — object-centric observations
+    filtered through the camera frustum, with spatial deduplication.
+    """
+    import numpy as np
+
+    # ── Load video references for video_clip_refs ──
+    videos_csv_path = session_dir / "videos_index.csv"
+    video_entries: List[Dict[str, Any]] = []
+    if videos_csv_path.exists():
+        vrows = load_csv(str(videos_csv_path))
+        # Only keep RGB videos (not depth) for clip references
+        video_entries = [r for r in vrows if r.get("camera_type", "") == "rgb"]
+    if video_entries:
+        print(f"Video refs: {len(video_entries)} RGB video(s)")
+    else:
+        print("WARNING: no RGB video entries in videos_index.csv — "
+              "video_clip_refs will be empty")
+
+    def _compute_video_refs(ts_ns: int) -> str:
+        """Compute video_clip_refs string for a given timestamp.
+
+        Returns a comma-separated list of "path#frame=N" references so the
+        retrieve pipeline can extract keyframes via ffmpeg.
+        """
+        refs: List[str] = []
+        for ve in video_entries:
+            start_ts = int(ve.get("start_ts", 0))
+            end_ts = int(ve.get("end_ts", 0))
+            start_fid = int(ve.get("start_frame_id", 0))
+            fps = float(ve.get("fps", 15.0))
+            # Only include if timestamp falls within video range
+            if start_ts <= ts_ns < end_ts:
+                frame_offset = start_fid + int((ts_ns - start_ts) / 1e9 * fps)
+                refs.append(f"{ve['file_path']}#frame={frame_offset}")
+            elif ts_ns < start_ts:
+                # Frame before video starts → use first frame
+                refs.append(f"{ve['file_path']}#frame={start_fid}")
+            else:
+                # Frame after video ends → use last frame
+                end_fid = int(ve.get("end_frame_id", 0))
+                refs.append(f"{ve['file_path']}#frame={end_fid}")
+        return ",".join(refs) if refs else ""
+
+    dedup_radii = _EMBODIED_DEDUP_RADII
+    default_radius = _EMBODIED_DEFAULT_RADIUS
+    max_images = _EMBODIED_MAX_IMAGES
+    cooldown = args.embodied_cooldown_frames
+
+    # ── Per-tick state (mirrors ObjectWatchdog instance vars) ──
+    seen_positions: Dict[str, List[float]] = {}  # cls → [x1,y1, x2,y2, …]
+    grid_node: Dict[str, int] = {}               # "cls@gx,gy" → parent node_id
+    grid_img_count: Dict[str, int] = {}           # "cls@gx,gy" → image count
+    grid_last_frame: Dict[str, int] = {}           # "cls@gx,gy" → last frame idx
+
+    t0 = time.time()
+    saved_new = 0
+    saved_append = 0
+    total_checks = 0
+    total_visible = 0
+
+    sorted_fids = sorted(frame_map.keys())
+
+    for frame_idx, fid in enumerate(sorted_fids):
+        fm = frame_map[fid]
+        ts = fm["ts"]
+        cam_x, cam_y, cam_z = fm["cam_x"], fm["cam_y"], fm["cam_z"]
+        qx, qy, qz, qw = fm["cam_qx"], fm["cam_qy"], fm["cam_qz"], fm["cam_qw"]
+        cam_yaw = _yaw_from_quat(qx, qy, qz, qw)
+
+        # ── Stage 1: FOV filter ──
+        visible: list = []  # (obj_id, obj_dict, ox, oy, oz, u, v, depth)
+        for obj_id, obj in objects_gt.items():
+            pos = obj.get("position", {})
+            ox = float(pos.get("x", 0))
+            oy = float(pos.get("y", 0))
+            oz = float(pos.get("z", 0))
+            total_checks += 1
+
+            u, v, depth = _world_to_pixel(
+                ox, oy, oz, cam_x, cam_y, cam_z, cam_yaw, camera_params,
+            )
+            if u is not None and depth is not None and depth > 0.01:
+                if 0 <= u < camera_params.width and 0 <= v < camera_params.height:
+                    visible.append((obj_id, obj, ox, oy, oz, u, v, depth))
+
+        total_visible += len(visible)
+        if not visible:
+            continue
+
+        # ── Stage 2: Classify — new (not spatially deduped) vs append ──
+        new_objects: list = []       # (obj_id, obj, ox, oy, oz, cls)
+        append_candidates: list = []  # (grid_key, obj_id, obj, ox, oy, oz)
+
+        for obj_id, obj, ox, oy, oz, u, v, depth in visible:
+            cls = obj.get("label_en", obj.get("label_zh", "unknown"))
+            radius = dedup_radii.get(cls, default_radius)
+            grid_key = f"{cls}@{round(ox)},{round(oy)}"
+
+            if _is_duplicate_by_class(cls, ox, oy, seen_positions, radius):
+                cnt = grid_img_count.get(grid_key, 0)
+                last_f = grid_last_frame.get(grid_key, -999)
+                if 0 < cnt < max_images and (frame_idx - last_f) >= cooldown:
+                    append_candidates.append((grid_key, obj_id, obj, ox, oy, oz))
+            else:
+                new_objects.append((obj_id, obj, ox, oy, oz, cls))
+                seen_positions.setdefault(cls, []).extend([ox, oy])
+
+        if not new_objects and not append_candidates:
+            continue
+
+        # ── Load frame image (one capture reused for the whole batch) ──
+        img_b64 = ""
+        img_path = session_dir / fm["image_path"]
+        if img_path.exists():
+            img_b64 = base64.b64encode(img_path.read_bytes()).decode()
+        if not img_b64:
+            continue
+
+        # ── Stage 3: Save genuinely-new objects ──
+        for obj_id, obj, ox, oy, oz, cls in new_objects:
+            grid_key = f"{cls}@{round(ox)},{round(oy)}"
+
+            spatial = SpatialContext(origin="world", objects=[
+                ObjectCoord(obj_id=obj_id, label=cls, x=ox, y=oy, z=oz),
+            ])
+            req = RememberRequest(
+                session_id=f"scenes2-{session_dir.name}",
+                plan_id=f"load-embodied-{fid:06d}",
+                log_record=LogRecord(
+                    ts=ts, level="Info", tag="scenes2",
+                    msg=f"observed new object: {cls} at ({ox:.1f},{oy:.1f},{oz:.1f})",
+                ),
+                spatial=spatial,
+                image_base64=img_b64,
+                camera_params=camera_params,
+                time_range=TimeRange(start_ts=ts, end_ts=ts),
+                kv={
+                    "objects": cls,
+                    "object_id": obj_id,
+                    "frame_ts": str(ts),
+                    "video_clip_refs": _compute_video_refs(ts),
+                },
+            )
+            try:
+                resp = await svc._remember_pipe.execute(req)
+                if resp.node_id >= 0:
+                    grid_node[grid_key] = resp.node_id
+                    grid_img_count[grid_key] = 1
+                    grid_last_frame[grid_key] = frame_idx
+                    saved_new += 1
+            except Exception as e:
+                print(f"  [new {cls} fid={fid}] ERROR: {e}")
+
+        # ── Stage 4: Append new viewing angles for known objects ──
+        for grid_key, obj_id, obj, ox, oy, oz in append_candidates:
+            parent_id = grid_node.get(grid_key)
+            if parent_id is None:
+                continue
+
+            cls = obj.get("label_en", obj.get("label_zh", "unknown"))
+            spatial = SpatialContext(origin="world", objects=[
+                ObjectCoord(obj_id=obj_id, label=cls, x=ox, y=oy, z=oz),
+            ])
+            req = RememberRequest(
+                session_id=f"scenes2-{session_dir.name}",
+                plan_id=f"load-embodied-append-{fid:06d}",
+                log_record=LogRecord(
+                    ts=ts, level="Info", tag="scenes2",
+                    msg=f"observed {cls} from another angle "
+                    f"(img {grid_img_count.get(grid_key,0)+1}/{max_images})",
+                ),
+                spatial=spatial,
+                image_base64=img_b64,
+                camera_params=camera_params,
+                time_range=TimeRange(start_ts=ts, end_ts=ts),
+                parent_node_id=parent_id,
+                kv={
+                    "objects": cls,
+                    "object_id": obj_id,
+                    "frame_ts": str(ts),
+                    "video_clip_refs": _compute_video_refs(ts),
+                },
+            )
+            try:
+                resp = await svc._remember_pipe.execute(req)
+                if resp.node_id >= 0:
+                    grid_img_count[grid_key] = grid_img_count.get(grid_key, 0) + 1
+                    grid_last_frame[grid_key] = frame_idx
+                    saved_append += 1
+            except Exception as e:
+                print(f"  [append {grid_key} fid={fid}] ERROR: {e}")
+
+    # ── Report ──
+    elapsed = time.time() - t0
+    total_nodes = saved_new + saved_append
+    unique = len(grid_node)
+    print(f"\nEmbodied mode results:")
+    print(f"  Frames processed:           {len(sorted_fids)}")
+    print(f"  Total object FOV checks:    {total_checks}")
+    print(f"  Objects in view (total):    {total_visible}")
+    print(f"  New objects saved:          {saved_new}")
+    print(f"  Angle appends saved:        {saved_append}")
+    print(f"  Unique objects tracked:     {unique}")
+    print(f"  Total nodes created:        {total_nodes}")
+    print(f"  Time:                       {elapsed:.1f}s "
+          f"({len(sorted_fids)/elapsed:.1f} fps)" if elapsed > 0 else "")
+
+    if unique:
+        print(f"  Avg images per object:      {(saved_new+saved_append)/unique:.1f}")
+
+    # Per-class breakdown
+    cls_nodes: Dict[str, int] = {}
+    cls_imgs: Dict[str, int] = {}
+    for gk, cnt in grid_img_count.items():
+        c = gk.split("@")[0]
+        cls_nodes[c] = cls_nodes.get(c, 0) + 1
+        cls_imgs[c] = cls_imgs.get(c, 0) + cnt
+    print(f"  Object nodes by class:")
+    for c in sorted(cls_nodes):
+        print(f"    {c}: {cls_nodes[c]} node(s), {cls_imgs[c]} total image(s)")
 
 
 if __name__ == "__main__":

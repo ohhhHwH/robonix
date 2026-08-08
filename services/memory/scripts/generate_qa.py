@@ -82,6 +82,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--max-qa-per-category", type=int, default=5)
     p.add_argument("--batch-size", type=int, default=50,
                    help="Max nodes per LLM call (controls prompt length)")
+    p.add_argument("--require-image-ratio", type=float, default=0.0,
+                   help="Target fraction of QA pairs with requires_image=true (0.0-1.0)")
     return p.parse_args()
 
 
@@ -191,6 +193,62 @@ def extract_json(text: str) -> Optional[List[Dict]]:
     return None
 
 
+def _enforce_image_ratio(pairs: List[Dict], target_ratio: float) -> List[Dict]:
+    """Post-process QA pairs so requires_image matches target_ratio.
+
+    When the LLM doesn't produce enough (or too many) image-requiring questions,
+    flip requires_image on the best candidates to hit the target.
+
+    Priority for flipping to True: questions about visual details (color, shape,
+    count, appearance).  Priority for flipping to False: existence / boolean
+    questions that can be answered from tags alone.
+    """
+    if not pairs or target_ratio <= 0:
+        return pairs
+
+    target_count = max(1, round(len(pairs) * target_ratio))
+    current = sum(1 for qa in pairs if qa.get("requires_image"))
+
+    if current == target_count:
+        return pairs
+
+    visual_keywords = ["颜色", "color", "形状", "shape", "大小", "size", "几个",
+                       "count", "状态", "status", "位置", "where", "长的", "look",
+                       "appear", "多少", "how many", "什么样", "what does"]
+
+    if current < target_count:
+        # Need MORE image-requiring QAs — flip the best non-image ones
+        candidates = [
+            (i, qa) for i, qa in enumerate(pairs)
+            if not qa.get("requires_image")
+        ]
+        # Prefer questions with visual keywords
+        candidates.sort(key=lambda x: sum(
+            1 for kw in visual_keywords
+            if kw in x[1].get("question_zh", "") or kw in x[1].get("question_en", "")
+        ), reverse=True)
+        for i, qa in candidates[:target_count - current]:
+            qa["requires_image"] = True
+            if qa.get("answer_type") == "boolean":
+                qa["answer_type"] = "boolean_with_reasoning"
+    else:
+        # Need FEWER image-requiring QAs — flip the weakest image ones
+        candidates = [
+            (i, qa) for i, qa in enumerate(pairs)
+            if qa.get("requires_image")
+        ]
+        # Prefer flipping boolean/existence QAs back to non-image
+        candidates.sort(key=lambda x: (
+            0 if x[1].get("answer_type") in ("boolean",) else 1,
+            sum(1 for kw in visual_keywords
+                if kw in x[1].get("question_zh", "") or kw in x[1].get("question_en", "")),
+        ))
+        for i, qa in candidates[:current - target_count]:
+            qa["requires_image"] = False
+
+    return pairs
+
+
 async def generate_category(
     args: argparse.Namespace, nodes: List[Dict],
     category: str, prefix: str,
@@ -241,6 +299,8 @@ async def main() -> None:
             await asyncio.sleep(3)
         prefix = CATEGORY_PREFIX[cat]
         pairs = await generate_category(args, nodes, cat, prefix)
+        if args.require_image_ratio > 0:
+            pairs = _enforce_image_ratio(pairs, args.require_image_ratio)
         all_qa[cat] = pairs
         total += len(pairs)
 

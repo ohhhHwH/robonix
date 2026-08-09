@@ -205,14 +205,27 @@ def _generate_summary(log_record: LogRecord,
 
     # Objects
     obj_names: List[str] = []
+    coord_parts: List[str] = []
     if spatial:
-        obj_names = [o.label for o in spatial.objects if o.label]
+        for o in spatial.objects[:5]:  # max 5 objects with coords
+            if o.label:
+                obj_names.append(o.label)
+            if o.x != 0.0 or o.y != 0.0 or o.z != 0.0:
+                label = o.label + " " if o.label else ""
+                coord_parts.append(f"{label}({o.x:.1f},{o.y:.1f},{o.z:.1f})")
     obj_str = ", ".join(obj_names) if obj_names else ""
 
+    # Append coordinates so BM25 can match spatial queries
+    coord_str = "; ".join(coord_parts) if coord_parts else ""
+
     if obj_str:
-        return f"{outcome} {action} {obj_str} in {scene}"
+        base = f"{outcome} {action} {obj_str} in {scene}"
     else:
-        return f"{outcome} {action} in {scene}"
+        base = f"{outcome} {action} in {scene}"
+
+    if coord_str:
+        base += f" at {coord_str}"
+    return base
 
 
 # ── Pipeline ────────────────────────────────────────────────────────────

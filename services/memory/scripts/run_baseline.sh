@@ -81,6 +81,9 @@ fi
 # ── Setup ──
 mkdir -p "$OUTPUT_DIR" "$QA_DIR"
 
+# Preserve captured images across runs (disable _clean_slate)
+export MEMGRAPH_KEEP_DATA=1
+
 # ── Stage 1: Load data (embodied mode) ──
 echo ""
 echo "=== Stage 1/4: Load scenes2 (embodied mode) ==="
@@ -90,6 +93,18 @@ cd "$SVC_DIR" && uv run python scripts/load_scenes2.py \
     --mode embodied \
     --data-dir "$MEMORY_DIR" \
     --embodied-cooldown-frames 30
+
+# Backup captured images to output directory
+IMAGES_SRC="${SVC_DIR}/data/images"
+IMAGES_BAK="${OUTPUT_DIR}/images"
+if [ -d "$IMAGES_SRC" ] && [ "$(ls -A "$IMAGES_SRC" 2>/dev/null)" ]; then
+    mkdir -p "$IMAGES_BAK"
+    cp -r "$IMAGES_SRC"/* "$IMAGES_BAK/" 2>/dev/null || true
+    IMG_COUNT=$(find "$IMAGES_BAK" -type f | wc -l)
+    echo "Images backed up: $IMG_COUNT files → $IMAGES_BAK"
+else
+    echo "WARNING: No captured images found at $IMAGES_SRC"
+fi
 
 if [ ! -f "${MEMORY_DIR}/memory_nodes.json" ]; then
     echo "ERROR: Stage 1 failed — memory_nodes.json not created"
@@ -109,18 +124,30 @@ print(vrefs)
 VIDEO_REF_PCT=$(python3 -c "print(round($VIDEO_REF_COUNT / $NODE_COUNT * 100, 1))")
 echo "  Nodes with video_clip_refs: $VIDEO_REF_COUNT/$NODE_COUNT (${VIDEO_REF_PCT}%)"
 
-# ── Stage 2: Generate QA pairs ──
+# ── Stage 2: QA pairs (use canonical fixed set, generate only if missing) ──
 echo ""
-echo "=== Stage 2/4: Generate QA pairs ==="
+echo "=== Stage 2/4: QA pairs ==="
 
-cd "$SVC_DIR" && uv run python scripts/generate_qa.py \
-    --input "${MEMORY_DIR}/memory_nodes.json" \
-    --output-dir "$QA_DIR" \
-    --llm-model "$VLM_MODEL" \
-    --llm-url "$VLM_BASE_URL" \
-    --llm-key "$VLM_API_KEY" \
-    --max-qa-per-category "$MAX_QA_PER_CATEGORY" \
-    --require-image-ratio "$REQUIRE_IMAGE_RATIO"
+CANONICAL_QA="${SESSION_DIR}/qa_pairs"
+
+if [ -d "$CANONICAL_QA" ] && [ "$(ls "$CANONICAL_QA"/*.json 2>/dev/null | wc -l)" -ge 6 ]; then
+    echo "Using canonical QA pairs from: $CANONICAL_QA"
+    cp "$CANONICAL_QA"/*.json "$CANONICAL_QA"/*.yaml "$QA_DIR/" 2>/dev/null || true
+else
+    echo "Canonical QA not found — generating fresh (ONE-TIME, save to dataset)"
+    cd "$SVC_DIR" && uv run python scripts/generate_qa.py \
+        --input "${MEMORY_DIR}/memory_nodes.json" \
+        --output-dir "$QA_DIR" \
+        --llm-model "$VLM_MODEL" \
+        --llm-url "$VLM_BASE_URL" \
+        --llm-key "$VLM_API_KEY" \
+        --max-qa-per-category "$MAX_QA_PER_CATEGORY" \
+        --require-image-ratio "$REQUIRE_IMAGE_RATIO"
+    # Save as canonical set for future runs
+    mkdir -p "$CANONICAL_QA"
+    cp "$QA_DIR"/*.json "$QA_DIR"/*.yaml "$CANONICAL_QA/" 2>/dev/null || true
+    echo "Canonical QA saved to: $CANONICAL_QA"
+fi
 
 QA_TOTAL=$(python3 -c "
 import json, os
@@ -130,7 +157,7 @@ for f in os.listdir('${QA_DIR}'):
         total += len(json.load(open(os.path.join('${QA_DIR}', f))))
 print(total)
 ")
-echo "Stage 2 done: $QA_TOTAL QA pairs generated"
+echo "Stage 2 done: $QA_TOTAL QA pairs (canonical)"
 echo "  Categories: $(ls "$QA_DIR"/*.json 2>/dev/null | wc -l)"
 
 # ── Stage 3: Evaluate ──

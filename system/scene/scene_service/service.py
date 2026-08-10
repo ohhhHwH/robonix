@@ -1588,16 +1588,16 @@ async def _run() -> None:
         # SCENE_OBJECT_WATCHDOG=1 to enable.
         *((log.info(
             "object_watchdog: enabled (SCENE_OBJECT_WATCHDOG=%s)",
-            os.environ.get("SCENE_OBJECT_WATCHDOG", "0"),
+            os.environ.get("SCENE_OBJECT_WATCHDOG", "1"),
         ) or [asyncio.create_task(
             ObjectWatchdog(
                 registry=registry, hub=hub, anno_store=anno_store,
             ).run(),
             name="object-watchdog",
-        )]) if os.environ.get("SCENE_OBJECT_WATCHDOG", "0") in ("1", "true", "yes")
+        )]) if os.environ.get("SCENE_OBJECT_WATCHDOG", "1") in ("1", "true", "yes")
         else (log.info(
             "object_watchdog: disabled (SCENE_OBJECT_WATCHDOG=%s)",
-            os.environ.get("SCENE_OBJECT_WATCHDOG", "0"),
+            os.environ.get("SCENE_OBJECT_WATCHDOG", "1"),
         ) or [])),
         # P2 guard: warn when mapping's live map identity drifts from the
         # binding scene started with (P3 will act on it instead).

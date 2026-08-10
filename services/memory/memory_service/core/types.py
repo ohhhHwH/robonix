@@ -23,6 +23,8 @@ class NodeType(Enum):
     SKILL = "skill"             # 9000-9998, protected (unless success rate drops)
     FIXED = "fixed"             # 9999 reserved, permanently protected
     LESSON = "lesson"           # long_term range, forget-protected
+    PATH_SEGMENT = "path_segment"         # robot traversal path
+    OBJECT_OBSERVATION = "object_observation"  # VLM object recognition child
 
 
 class CausalRelation(Enum):

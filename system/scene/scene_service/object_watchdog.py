@@ -16,9 +16,25 @@ Pilot to call ``list_objects`` — it is designed for the patrol /
 exploration use-case where the robot moves and new objects appear in
 view continuously.
 
+The polling interval adapts to robot motion state detected from
+odometry / IMU data (via ``SubscribersHub``) or set explicitly via
+``set_motion_state()``:
+
+  ==============  ========  ====
+  moving          >0.2 m/s   2 s
+  rotating        >10 °/s    5 s
+  static          —         30 s
+  static_long     >5 min   120 s
+  ==============  ========  ====
+
 Env vars:
-  ``SCENE_OBJECT_WATCHDOG`` — set to ``"1"`` to enable (default ``"0"``).
-  ``OBJECT_WATCHDOG_INTERVAL_S`` — poll interval in seconds (default 2.0).
+  ``SCENE_OBJECT_WATCHDOG`` — set to ``"0"`` to disable (default ``"1"``).
+  ``OBJECT_WATCHDOG_INTERVAL_MOVING_S`` — moving interval (default 2.0).
+  ``OBJECT_WATCHDOG_INTERVAL_ROTATING_S`` — rotating interval (default 5.0).
+  ``OBJECT_WATCHDOG_INTERVAL_STATIC_S`` — static interval (default 30.0).
+  ``OBJECT_WATCHDOG_INTERVAL_STATIC_LONG_S`` — long-static interval (default 120.0).
+  ``OBJECT_WATCHDOG_STATIC_LONG_THRESHOLD_S`` — long-static threshold (default 300.0).
+  ``OBJECT_WATCHDOG_INTERVAL_S`` — fallback / legacy interval (default 2.0).
 """
 
 from __future__ import annotations
@@ -26,9 +42,10 @@ from __future__ import annotations
 import asyncio
 import base64
 import logging
+import math
 import os
 import time
-from typing import Any, Dict, Set
+from typing import Any, Dict, Optional, Set
 
 import numpy as np
 
@@ -47,6 +64,43 @@ _MEMGRAPH_HOOK_URL = os.environ.get(
     "http://127.0.0.1:37798",
 )
 _DEFAULT_INTERVAL_S = 2.0
+
+# ── Dynamic interval env vars ──────────────────────────────────────────
+
+_INTERVAL_MOVING_S = float(os.environ.get(
+    "OBJECT_WATCHDOG_INTERVAL_MOVING_S", "2.0"))
+_INTERVAL_ROTATING_S = float(os.environ.get(
+    "OBJECT_WATCHDOG_INTERVAL_ROTATING_S", "5.0"))
+_INTERVAL_STATIC_S = float(os.environ.get(
+    "OBJECT_WATCHDOG_INTERVAL_STATIC_S", "30.0"))
+_INTERVAL_STATIC_LONG_S = float(os.environ.get(
+    "OBJECT_WATCHDOG_INTERVAL_STATIC_LONG_S", "120.0"))
+_STATIC_LONG_THRESHOLD_S = float(os.environ.get(
+    "OBJECT_WATCHDOG_STATIC_LONG_THRESHOLD_S", "300.0"))
+
+# Motion state names
+_MOVING = "moving"
+_ROTATING = "rotating"
+_STATIC = "static"
+_STATIC_LONG = "static_long"
+
+# Motion detection thresholds
+_MOVING_LINEAR_VEL_THRESH = 0.2       # m/s
+_ROTATING_ANGULAR_VEL_THRESH = 10.0   # deg/s, converted to rad/s below
+_ROTATING_ANGULAR_VEL_THRESH_RAD = _ROTATING_ANGULAR_VEL_THRESH * (math.pi / 180.0)
+# Linear vel below this AND angular vel below → static
+_STATIC_LINEAR_VEL_MAX = 0.2
+_STATIC_ANGULAR_VEL_MAX_RAD = 10.0 * (math.pi / 180.0)
+
+
+def _compute_interval(motion_state: str) -> float:
+    """Return the polling interval for a given motion state."""
+    return {
+        _MOVING: _INTERVAL_MOVING_S,
+        _ROTATING: _INTERVAL_ROTATING_S,
+        _STATIC: _INTERVAL_STATIC_S,
+        _STATIC_LONG: _INTERVAL_STATIC_LONG_S,
+    }.get(motion_state, _DEFAULT_INTERVAL_S)
 
 
 class ObjectWatchdog:
@@ -71,7 +125,7 @@ class ObjectWatchdog:
         self._hub = hub
         self._memgraph_url = memgraph_url
         self._anno_store = anno_store  # AnnotationStore or None
-        self._interval = (
+        self._fallback_interval = (
             interval_s
             if interval_s > 0
             else float(os.environ.get("OBJECT_WATCHDOG_INTERVAL_S", _DEFAULT_INTERVAL_S))
@@ -91,7 +145,29 @@ class ObjectWatchdog:
         self._task: asyncio.Task | None = None
         self._running = False
 
+        # ── Motion state (dynamic interval) ──
+        self._motion_state: str = _STATIC  # current state: moving/rotating/static/static_long
+        self._static_start: Optional[float] = None  # when we entered static state
+        self._motion_override: Optional[str] = None  # set via set_motion_state()
+        # Odometry subscription name to poll from hub.
+        self._odom_topic: str = os.environ.get(
+            "OBJECT_WATCHDOG_ODOM_TOPIC", "/odom",
+        )
+
     # ── lifecycle ──────────────────────────────────────────────────────
+
+    def set_motion_state(self, state: str) -> None:
+        """Override motion state from external source (e.g. Pilot / PathRecorder).
+
+        Valid states: ``"moving"``, ``"rotating"``, ``"static"``.
+        Set to ``None`` or ``""`` to resume auto-detection from odometry.
+        """
+        if state in (None, ""):
+            self._motion_override = None
+        elif state in (_MOVING, _ROTATING, _STATIC):
+            self._motion_override = state
+        else:
+            log.warning("object_watchdog: unknown motion state %r — ignored", state)
 
     async def run(self) -> None:
         """Blocking async entrypoint — use ``asyncio.create_task(wd.run())``."""
@@ -115,24 +191,97 @@ class ObjectWatchdog:
             total = 0
 
         log.info(
-            "object_watchdog: v2 started (interval=%.1fs, %d known, "
-            "max_images=%d, dedup=per-class, url=%s)",
-            self._interval, total, self._max_images_per_object,
-            self._memgraph_url,
+            "object_watchdog: started (dynamic intervals: "
+            "moving=%.1fs, rotating=%.1fs, static=%.1fs, static_long=%.1fs, "
+            "threshold=%.0fs, %d known, max_images=%d, dedup=per-class)",
+            _INTERVAL_MOVING_S, _INTERVAL_ROTATING_S,
+            _INTERVAL_STATIC_S, _INTERVAL_STATIC_LONG_S,
+            _STATIC_LONG_THRESHOLD_S,
+            total, self._max_images_per_object,
         )
 
         while self._running:
+            start = time.monotonic()
             try:
                 await self._tick()
             except Exception:
                 log.debug("object_watchdog: tick error", exc_info=True)
-            await asyncio.sleep(self._interval)
+
+            # ── Dynamic interval: detect motion → choose interval ──
+            interval = self._select_interval()
+            elapsed = time.monotonic() - start
+            sleep_s = max(0.05, interval - elapsed)
+            await asyncio.sleep(sleep_s)
 
     def stop(self) -> None:
         """Signal the loop to exit at the next sleep boundary."""
         self._running = False
         if self._task is not None:
             self._task.cancel()
+
+    # ── dynamic interval ──────────────────────────────────────────────
+
+    def _select_interval(self) -> float:
+        """Detect motion state and return the appropriate interval."""
+        # 1. External override
+        if self._motion_override is not None:
+            self._motion_state = self._motion_override
+        else:
+            # 2. Auto-detect from odometry
+            self._motion_state = self._detect_motion()
+
+        return _compute_interval(self._motion_state)
+
+    def _detect_motion(self) -> str:
+        """Detect robot motion state from hub odometry data.
+
+        Falls back to ``_STATIC`` if odometry is unavailable.
+        """
+        linear_vel = 0.0
+        angular_vel = 0.0
+
+        # Try to read odometry from hub
+        if self._hub is not None:
+            for topic in (self._odom_topic, "/odom", "odom"):
+                if self._hub.has(topic):
+                    msg, _stamp, _count = self._hub.latest(topic)
+                    if msg is not None:
+                        # Try common odometry field names
+                        twist = getattr(msg, "twist", None)
+                        if twist is not None:
+                            linear = getattr(twist, "linear", None)
+                            if linear is not None:
+                                linear_vel = max(
+                                    abs(float(getattr(linear, "x", 0))),
+                                    abs(float(getattr(linear, "y", 0))),
+                                )
+                            angular = getattr(twist, "angular", None)
+                            if angular is not None:
+                                angular_vel = abs(float(getattr(angular, "z", 0)))
+                        # Alternative: direct speed fields
+                        if linear_vel == 0.0 and angular_vel == 0.0:
+                            linear_vel = abs(float(getattr(msg, "linear_velocity", 0)
+                                                or getattr(msg, "linear_speed", 0)))
+                            angular_vel = abs(float(getattr(msg, "angular_velocity", 0)
+                                                 or getattr(msg, "angular_speed", 0)))
+                    break
+
+        # ── Classify ──
+        if linear_vel > _MOVING_LINEAR_VEL_THRESH:
+            self._static_start = None
+            return _MOVING
+
+        if angular_vel > _ROTATING_ANGULAR_VEL_THRESH_RAD:
+            self._static_start = None
+            return _ROTATING
+
+        # Static — track duration for long-static transition
+        now = time.monotonic()
+        if self._static_start is None:
+            self._static_start = now
+        if now - self._static_start >= _STATIC_LONG_THRESHOLD_S:
+            return _STATIC_LONG
+        return _STATIC
 
     # ── tick logic ─────────────────────────────────────────────────────
 
@@ -525,3 +674,220 @@ class ObjectWatchdog:
             log.debug("object_watchdog: append POST failed for node %d",
                      node_id, exc_info=True)
             return False
+
+
+# ═════════════════════════════════════════════════════════════════════════
+# PlaceNodeManager — creates/updates PlaceNode memory nodes for static regions
+# ═════════════════════════════════════════════════════════════════════════
+
+# Minimum distance (metres) to the nearest existing PlaceNode before
+# creating a new one.
+_PLACE_MIN_DIST_M = float(os.environ.get("PLACE_NODE_MIN_DIST_M", "2.0"))
+# Minimum stay duration (seconds) before creating a PlaceNode.
+_PLACE_MIN_STAY_S = float(os.environ.get("PLACE_NODE_MIN_STAY_S", "10.0"))
+# Update interval for PlaceNode duration field (seconds).
+_PLACE_UPDATE_INTERVAL_S = float(os.environ.get("PLACE_NODE_UPDATE_INTERVAL_S", "60.0"))
+
+
+class PlaceNodeManager:
+    """Manage PlaceNode creation for robot stationary periods.
+
+    Tracks robot position and region, creates ``node_type="place"``
+    MemoryNodes when the robot enters a new area, updates duration on
+    each tick, and closes the PlaceNode when the robot leaves.
+
+    Usage::
+
+        mgr = PlaceNodeManager(memgraph_url="http://127.0.0.1:37798")
+        # On each tick:
+        nid = await mgr.tick(x, y, region, is_moving=False)
+    """
+
+    def __init__(self, memgraph_url: str = _MEMGRAPH_HOOK_URL) -> None:
+        self._url = memgraph_url
+        self._current_node_id: Optional[int] = None
+        self._current_region: str = ""
+        self._enter_ts: float = 0.0
+        self._last_update_ts: float = 0.0
+        self._last_x: float = 0.0
+        self._last_y: float = 0.0
+        # Track known PlaceNode positions for region transition detection.
+        self._known_centers: List[tuple] = []  # [(x, y, region, node_id), ...]
+
+    @property
+    def current_node_id(self) -> Optional[int]:
+        """The current PlaceNode's node_id, or None."""
+        return self._current_node_id
+
+    async def tick(
+        self, x: float, y: float, region: str, *, is_moving: bool = False,
+    ) -> Optional[int]:
+        """Call on each watchdog tick.  Returns the current PlaceNode's
+        node_id (for use as parent_node_id), or None.
+
+        Creates, updates, or closes PlaceNodes based on position + region.
+        """
+        now = time.time()
+
+        # ── Moving → close PlaceNode ──
+        if is_moving:
+            if self._current_node_id is not None:
+                duration = now - self._enter_ts
+                if duration >= _PLACE_MIN_STAY_S:
+                    await self._update_place_node(self._current_node_id, duration)
+                    log.info("place_node: closed node %d (duration=%.0fs, moving)",
+                             self._current_node_id, duration)
+                else:
+                    # Too short — remove the node
+                    await self._delete_place_node(self._current_node_id)
+                    log.info("place_node: removed node %d (duration=%.0fs < %.0fs)",
+                             self._current_node_id, duration, _PLACE_MIN_STAY_S)
+                self._current_node_id = None
+                self._current_region = ""
+            return None
+
+        # ── Static / rotating → maintain PlaceNode ──
+        # Check if we've changed regions or moved far from current PlaceNode
+        new_region = self._check_region_transition(x, y, region)
+
+        if new_region or self._current_node_id is None:
+            # Close previous PlaceNode if any
+            if self._current_node_id is not None:
+                duration = now - self._enter_ts
+                if duration >= _PLACE_MIN_STAY_S:
+                    await self._update_place_node(self._current_node_id, duration)
+                else:
+                    await self._delete_place_node(self._current_node_id)
+
+            # Create new PlaceNode
+            nid = await self._create_place_node(x, y, region)
+            if nid is not None:
+                self._current_node_id = nid
+                self._current_region = region
+                self._enter_ts = now
+                self._last_update_ts = now
+                self._last_x, self._last_y = x, y
+                self._known_centers.append((x, y, region, nid))
+                log.info("place_node: created node %d at region=%s (%.1f,%.1f)",
+                         nid, region, x, y)
+            return nid
+
+        # Update position tracking and periodic duration update
+        self._last_x, self._last_y = x, y
+        if now - self._last_update_ts >= _PLACE_UPDATE_INTERVAL_S:
+            duration = now - self._enter_ts
+            await self._update_place_node(self._current_node_id, duration)
+            self._last_update_ts = now
+
+        return self._current_node_id
+
+    def _check_region_transition(self, x: float, y: float, region: str) -> bool:
+        """Return True if the robot has entered a genuinely new area."""
+        if region and region != self._current_region:
+            return True
+        # Check distance to current PlaceNode center
+        if self._current_node_id is not None:
+            dist = ((x - self._last_x) ** 2 + (y - self._last_y) ** 2) ** 0.5
+            if dist > _PLACE_MIN_DIST_M * 3:  # drifted far from tracking pos
+                return True
+        # Check distance to ALL known PlaceNode centers
+        for cx, cy, _cr, _cnid in self._known_centers:
+            if ((x - cx) ** 2 + (y - cy) ** 2) <= _PLACE_MIN_DIST_M ** 2:
+                return False  # near known PlaceNode — reuse
+        return True  # far from all known → new region
+
+    # ── HTTP ──────────────────────────────────────────────────────────
+
+    async def _create_place_node(self, x: float, y: float, region: str) -> Optional[int]:
+        """POST a new PlaceNode to memgraph."""
+        import httpx
+
+        now_ns = time.time_ns()
+        region_str = region or "unknown"
+        summary = (
+            f"robot stationed at region={region_str}, "
+            f"center=({x:.1f},{y:.1f},0.0)"
+        )
+        payload = {
+            "session_id": "scene-place",
+            "plan_id": "scene-place",
+            "log_record": {
+                "ts": now_ns,
+                "level": "Info",
+                "tag": "place_manager",
+                "msg": summary,
+            },
+            "spatial": {
+                "origin": "world",
+                "center": {"x": x, "y": y, "z": 0.0},
+                "radius_m": 2.0,
+                "semantic_region": region_str,
+                "objects": [],
+            },
+            "kv": {
+                "node_type": "place",
+                "region": region_str,
+                "center_x": x,
+                "center_y": y,
+            },
+        }
+
+        try:
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                r = await client.post(self._url, json=payload)
+            if r.status_code >= 400:
+                log.warning("place_node: create POST returned %d: %s",
+                            r.status_code, r.text[:200])
+                return None
+            return r.json().get("node_id")
+        except Exception as e:
+            log.debug("place_node: create POST failed: %s", e)
+            return None
+
+    async def _update_place_node(self, node_id: int, duration_s: float) -> None:
+        """Update a PlaceNode's duration (append-only update via POST)."""
+        import httpx
+
+        now_ns = time.time_ns()
+        payload = {
+            "session_id": "scene-place",
+            "plan_id": "scene-place",
+            "log_record": {
+                "ts": now_ns,
+                "level": "Info",
+                "tag": "place_manager",
+                "msg": f"updated duration={duration_s:.0f}s",
+            },
+            "spatial": {"origin": "world", "objects": []},
+            "parent_node_id": node_id,
+            "kv": {
+                "node_type": "place",
+                "append_image_ref": True,
+                "duration_s": round(duration_s, 1),
+            },
+        }
+
+        try:
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                r = await client.post(self._url, json=payload)
+            if r.status_code >= 400:
+                log.debug("place_node: update POST for node %d returned %d",
+                          node_id, r.status_code)
+        except Exception as e:
+            log.debug("place_node: update POST for node %d failed: %s", node_id, e)
+
+    async def _delete_place_node(self, node_id: int) -> None:
+        """Remove a PlaceNode that was too short-lived."""
+        import httpx
+
+        try:
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                r = await client.post(
+                    f"{self._url.rstrip('/')}/delete/{node_id}",
+                    json={"node_id": node_id},
+                )
+            if r.status_code >= 400:
+                log.debug("place_node: delete POST for node %d returned %d",
+                          node_id, r.status_code)
+        except Exception as e:
+            log.debug("place_node: delete POST for node %d failed: %s", node_id, e)

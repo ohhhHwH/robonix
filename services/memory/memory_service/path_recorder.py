@@ -127,6 +127,9 @@ class PathRecorder:
         self._prev_yaw: Optional[float] = None
         # Track committed segment node_ids (auto-split)
         self._committed_nodes: List[int] = []
+        # Snapshot of last committed segment for VLMObserver
+        self._last_waypoints: List[Dict[str, Any]] = []
+        self._last_images_b64: List[str] = []
 
     # ── public API ──────────────────────────────────────────────────────
 
@@ -261,6 +264,9 @@ class PathRecorder:
         node_id = self._post(payload)
         if node_id is not None and node_id > 0:
             self._committed_nodes.append(node_id)
+            # Snapshot for VLMObserver integration
+            self._last_waypoints = list(self._waypoints)
+            self._last_images_b64 = list(self._images_b64)
             log.info(
                 "path_recorder: segment → node %d (%d waypoints, %.1fm)",
                 node_id, n, length,
@@ -275,6 +281,29 @@ class PathRecorder:
         self._prev_yaw = None
 
         return node_id
+
+    # ── VLMObserver integration ─────────────────────────────────────────
+
+    def get_last_segment_data(self) -> Optional[Dict[str, Any]]:
+        """Return the last committed segment's data for VLMObserver.
+
+        Returns a dict with keys ``node_id``, ``waypoints`` (list of
+        {x, y, z, yaw, ts}), ``images_b64`` (list of base64 JPEG strings),
+        or ``None`` if no segment has been committed yet.
+
+        The caller (VLMObserver) iterates over waypoints + images to run
+        VLM object recognition and create ``object_observation`` child nodes
+        linked via ``parent_node_id``.
+        """
+        if not self._committed_nodes:
+            return None
+        last_nid = self._committed_nodes[-1]
+        # Build from the last snapshot captured before reset
+        return {
+            "node_id": last_nid,
+            "waypoints": self._last_waypoints,
+            "images_b64": self._last_images_b64,
+        }
 
     # ── properties ──────────────────────────────────────────────────────
 

@@ -799,6 +799,7 @@ def _start_scene_hook_server() -> None:
                     plan_id=data.get("plan_id", "scene-hook"),
                     log_record=lr,
                     spatial=spatial,
+                    parent_node_id=data.get("parent_node_id"),
                     image_base64=data.get("image_base64", ""),
                     kv=data.get("kv") if isinstance(data.get("kv"), dict) else {},
                 )

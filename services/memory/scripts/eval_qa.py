@@ -98,6 +98,53 @@ ANSWER:"""
     return result if result else context[:500]
 
 
+# ── Chinese number normalization ──────────────────────────────────────────
+
+_SIMPLE_ZH = {
+    "零": "0", "一": "1", "二": "2", "三": "3", "四": "4",
+    "五": "5", "六": "6", "七": "7", "八": "8", "九": "9", "两": "2",
+}
+
+
+def _normalize_zh_numbers(text: str) -> str:
+    """Convert Chinese numerals to Arabic digits for fuzzy matching.
+
+    Handles compound numbers: 三十五→35, 二十→20, 十二→12, 十→10.
+    """
+    # X十Y → XY  (三十五 → 35, 二十四 → 24)
+    text = re.sub(
+        r'([一二三四五六七八九])十([一二三四五六七八九])',
+        lambda m: str(int(_SIMPLE_ZH[m.group(1)]) * 10 + int(_SIMPLE_ZH[m.group(2)])),
+        text,
+    )
+    # X十 → X0  (二十 → 20, 三十 → 30)
+    text = re.sub(
+        r'([二三四五六七八九])十',
+        lambda m: str(int(_SIMPLE_ZH[m.group(1)]) * 10),
+        text,
+    )
+    # 十Y → 1Y  (十二 → 12, 十五 → 15)
+    text = re.sub(
+        r'十([一二三四五六七八九])',
+        lambda m: str(10 + int(_SIMPLE_ZH[m.group(1)])),
+        text,
+    )
+    # Bare 十 → 10
+    text = text.replace("十", "10")
+    # Single digits
+    for zh, num in _SIMPLE_ZH.items():
+        text = text.replace(zh, num)
+    return text
+
+
+def _extract_numbers(text: str) -> List[float]:
+    """Extract all numeric values (int or float) from text.
+
+    Used for relaxed open_short matching when substring fails.
+    """
+    return [float(m) for m in re.findall(r'\d+(?:\.\d+)?', text)]
+
+
 def _rule_judge(
     question: str, predicted: str, ground_truth: str,
     acceptable: List[str], answer_type: str,
@@ -113,17 +160,32 @@ def _rule_judge(
     if answer_type == "boolean":
         # Map common boolean expressions to True/False
         def _parse_bool(text: str) -> Optional[bool]:
-            pos = ["yes", "是", "有", "true", "对", "correct", "存在", "看到"]
-            neg = ["no", "否", "没有", "无", "false", "不对", "incorrect", "不存在", "没看到"]
-            # Exact match first
+            pos = [
+                "yes", "是", "有", "true", "对", "correct", "存在", "看到",
+                "看到了", "观察到了", "检测到了", "有的", "存在的", "是的没错",
+                "没错", "可以", "能", "发现了", "记录到", "观察到有",
+            ]
+            neg = [
+                "no", "否", "没有", "无", "false", "不对", "incorrect",
+                "不存在", "没看到", "没观察到", "未观察到", "没检测到",
+                "没有的", "不存在的", "不可以", "不能", "无法",
+                "未发现", "没发现", "未检测到", "未记录", "没记录",
+                "没有发现", "没有记录", "无相关",
+            ]
+            # Exact match first (strip trailing punctuation)
             t = text.rstrip(".。!！?？")
             if t in pos: return True
             if t in neg: return False
-            # Substring match (longer patterns first)
-            for p in sorted(pos, key=len, reverse=True):
-                if p in t: return True
-            for p in sorted(neg, key=len, reverse=True):
-                if p in t: return False
+            # Substring match: check both lists together, longest match wins.
+            # This prevents short pos patterns ("有") from beating longer neg
+            # patterns ("没有发现", "没有") in texts like "没有发现灭火器".
+            candidates = (
+                [(p, True) for p in pos] +
+                [(p, False) for p in neg]
+            )
+            for p, is_pos in sorted(candidates, key=lambda x: len(x[0]), reverse=True):
+                if p in t:
+                    return is_pos
             return None
 
         pred_bool = _parse_bool(pt)
@@ -140,18 +202,77 @@ def _rule_judge(
                             "method": "rule_boolean_acc"}
         return None  # Can't parse → fall back to LLM
 
-    if answer_type in ("open_short", "boolean_with_reasoning"):
-        # Check if ground truth (or any acceptable answer) appears in predicted
+    if answer_type == "boolean_with_reasoning":
+        # Pre-processing: extract boolean conclusion before reasoning clauses.
+        # Many LLMs answer "是，因为..." / "没有，原因是..." — we want the lead-in.
+        # Take the fragment before the first comma / period / newline / reasoning
+        # connector, then strip residual connector words.
+        conclusion = re.split(r'[，,。\n]', predicted.strip())[0].strip().lower()
+        conclusion = re.sub(r'^(因为|原因是|由于|根据|理由|因为|鉴于|基于)',
+                          '', conclusion).strip()
+        # Also try stripping trailing reasoning connectors
+        conclusion = re.sub(r'(因为|原因是|由于).*$', '', conclusion).strip()
+
+        # 1) Try substring match (normalized) on full predicted text
         if len(gt) >= 3 and gt in pt:
             return {"correct": True, "confidence": 0.9, "method": "rule_substring"}
         for acc in acceptable:
             acc_lower = acc.strip().lower()
             if len(acc_lower) >= 3 and acc_lower in pt:
+                return {"correct": True, "confidence": 0.85,
+                        "method": "rule_substring_acc"}
+
+        # 2) Fall back to boolean parsing on the extracted conclusion
+        if conclusion:
+            bool_result = _rule_judge(
+                question, conclusion, ground_truth, acceptable, "boolean",
+            )
+            if bool_result is not None:
+                bool_result["method"] = "rule_bool_from_reasoning"
+                return bool_result
+
+        # 3) Last resort: parse full text as boolean
+        return _rule_judge(question, predicted, ground_truth, acceptable, "boolean")
+
+    if answer_type == "open_short":
+        # 1) Exact substring match (original + normalized both sides)
+        if len(gt) >= 2 and gt in pt:
+            return {"correct": True, "confidence": 0.9, "method": "rule_substring"}
+        # Normalized match: convert "两个" ↔ "2个"
+        pt_norm = _normalize_zh_numbers(pt)
+        gt_norm = _normalize_zh_numbers(gt)
+        if len(gt_norm) >= 2 and gt_norm in pt_norm:
+            return {"correct": True, "confidence": 0.88, "method": "rule_substring_zh_norm"}
+
+        for acc in acceptable:
+            acc_lower = acc.strip().lower()
+            if len(acc_lower) >= 2 and acc_lower in pt:
                 return {"correct": True, "confidence": 0.85, "method": "rule_substring_acc"}
-        # For boolean_with_reasoning where GT is a simple yes/no
-        if answer_type == "boolean_with_reasoning":
-            return _rule_judge(question, predicted, ground_truth, acceptable, "boolean")
-        # Can't confirm match → don't auto-reject, let LLM judge
+            # Normalized acceptable
+            acc_norm = _normalize_zh_numbers(acc_lower)
+            if len(acc_norm) >= 2 and acc_norm in pt_norm:
+                return {"correct": True, "confidence": 0.83,
+                        "method": "rule_substring_acc_zh_norm"}
+
+        # 2) Relaxed match: extract numbers and compare
+        pt_nums = _extract_numbers(pt_norm)
+        gt_nums = _extract_numbers(gt_norm)
+        if pt_nums and gt_nums:
+            if pt_nums == gt_nums:
+                return {"correct": True, "confidence": 0.8,
+                        "method": "rule_num_match"}
+            # If GT has 1 number and predicted shares it → close enough
+            if len(gt_nums) == 1 and gt_nums[0] in pt_nums:
+                return {"correct": True, "confidence": 0.75,
+                        "method": "rule_num_contains"}
+            # Check acceptable answers too
+            for acc in acceptable:
+                acc_nums = _extract_numbers(_normalize_zh_numbers(acc.strip().lower()))
+                if acc_nums and acc_nums == pt_nums:
+                    return {"correct": True, "confidence": 0.75,
+                            "method": "rule_num_match_acc"}
+
+        # Can't confirm → let LLM judge
         return None
 
     # For ordered_list and description: needs LLM

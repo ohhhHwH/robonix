@@ -1584,14 +1584,21 @@ async def _run() -> None:
         geometry_task,
         asyncio.create_task(_stale_tick(registry), name="scene-stale-tick"),
         # Object-level watchdog: polls the registry for NEW objects and
-        # saves one image per object to memgraph.  Default on; set
-        # SCENE_OBJECT_WATCHDOG=0 to disable.
-        *([asyncio.create_task(
+        # saves one image per object to memgraph.  Default off; set
+        # SCENE_OBJECT_WATCHDOG=1 to enable.
+        *((log.info(
+            "object_watchdog: enabled (SCENE_OBJECT_WATCHDOG=%s)",
+            os.environ.get("SCENE_OBJECT_WATCHDOG", "0"),
+        ) or [asyncio.create_task(
             ObjectWatchdog(
                 registry=registry, hub=hub, anno_store=anno_store,
             ).run(),
             name="object-watchdog",
-        )] if os.environ.get("SCENE_OBJECT_WATCHDOG", "1") in ("1", "true", "yes") else []),
+        )]) if os.environ.get("SCENE_OBJECT_WATCHDOG", "0") in ("1", "true", "yes")
+        else (log.info(
+            "object_watchdog: disabled (SCENE_OBJECT_WATCHDOG=%s)",
+            os.environ.get("SCENE_OBJECT_WATCHDOG", "0"),
+        ) or [])),
         # P2 guard: warn when mapping's live map identity drifts from the
         # binding scene started with (P3 will act on it instead).
         asyncio.create_task(

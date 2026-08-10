@@ -13,14 +13,19 @@
 #   DRY_RUN=1 ./scripts/run_baseline.sh                # print commands only
 #
 # Env vars:
-#   VLM_API_KEY           DeepSeek API key (required for QA gen + eval LLM judge)
-#   VLM_BASE_URL          DeepSeek base URL (default: https://api.deepseek.com)
-#   VLM_MODEL             Model name (default: deepseek-v4-flash)
-#   MEM_VLM_API_KEY       Aliyun/backup VLM key (for QA images)
-#   EVAL_QA_DELAY_S       Delay between QA pairs (default: 1.5)
-#   MEMGRAPH_LLM_RETRIES  LLM ranker retry attempts (default: 3)
-#   DATA_DIR              Dataset root (default: /home/hyl/embodypaper/datasets)
-#   OUTPUT_DIR            Results output dir (default: auto-dated)
+#   VLM_API_KEY              DeepSeek API key (required for QA gen + eval LLM judge)
+#   VLM_BASE_URL             DeepSeek base URL (default: https://api.deepseek.com)
+#   VLM_MODEL                Model name (default: deepseek-v4-flash)
+#   MEM_VLM_API_KEY          Aliyun/backup VLM key (for QA images)
+#   EVAL_QA_DELAY_S          Delay between QA pairs (default: 1.5)
+#   MEMGRAPH_LLM_RETRIES     LLM ranker retry attempts (default: 3)
+#   MEMGRAPH_BACKUP_LLM_KEY  Dedicated backup LLM ranker API key
+#                             (if unset, falls back to MEM_VLM_* for Aliyun qwen)
+#   MEMGRAPH_BACKUP_LLM_URL  Dedicated backup LLM ranker base URL
+#                             (should differ from VLM_BASE_URL to avoid
+#                              same-provider failure mode)
+#   DATA_DIR                 Dataset root (default: /home/hyl/embodypaper/datasets)
+#   OUTPUT_DIR               Results output dir (default: auto-dated)
 
 set -euo pipefail
 

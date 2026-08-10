@@ -73,12 +73,46 @@ def _llm_config() -> dict:
 
 
 def _llm_backup_config() -> dict:
-    """Resolve backup LLM endpoint (tried when primary returns empty)."""
-    return {
-        "base_url": os.environ.get("MEMGRAPH_LLM_BACKUP_BASE_URL", ""),
-        "api_key": os.environ.get("MEMGRAPH_LLM_BACKUP_API_KEY", ""),
-        "model": os.environ.get("MEMGRAPH_LLM_BACKUP_MODEL", "gpt-4.1"),
-    }
+    """Resolve backup LLM endpoint (tried when primary returns empty).
+
+    Priority:
+      1. MEMGRAPH_BACKUP_LLM_*  — dedicated backup provider (new)
+      2. MEMGRAPH_LLM_BACKUP_*  — legacy backup vars
+      3. MEM_VLM_*              — Aliyun qwen VLM endpoint (last resort)
+    """
+    # Tier 1: dedicated backup
+    base_url = os.environ.get("MEMGRAPH_BACKUP_LLM_URL", "")
+    api_key = os.environ.get("MEMGRAPH_BACKUP_LLM_KEY", "")
+    model = os.environ.get("MEMGRAPH_BACKUP_LLM_MODEL", "")
+    if base_url and api_key:
+        return {"base_url": base_url, "api_key": api_key,
+                "model": model or "qwen3.6-flash"}
+
+    # Tier 2: legacy backup vars
+    base_url = os.environ.get("MEMGRAPH_LLM_BACKUP_BASE_URL", "")
+    api_key = os.environ.get("MEMGRAPH_LLM_BACKUP_API_KEY", "")
+    model = os.environ.get("MEMGRAPH_LLM_BACKUP_MODEL", "")
+    if base_url and api_key:
+        return {"base_url": base_url, "api_key": api_key,
+                "model": model or "gpt-4.1"}
+
+    # Tier 3: VLM endpoint as last resort (Aliyun qwen / compatible)
+    vlm_url = os.environ.get("MEM_VLM_BASE_URL", "")
+    vlm_key = os.environ.get("MEM_VLM_API_KEY", "")
+    vlm_model = os.environ.get("MEM_VLM_MODEL", "")
+    if vlm_url and vlm_key:
+        log.debug("llm_search: using VLM endpoint as backup LLM (%s)", vlm_model)
+        return {"base_url": vlm_url, "api_key": vlm_key,
+                "model": vlm_model or "qwen3.6-flash"}
+
+    return {"base_url": "", "api_key": "", "model": ""}
+
+
+def _is_same_provider(cfg_a: dict, cfg_b: dict) -> bool:
+    """Check whether two LLM configs point to the same API endpoint."""
+    if not cfg_a.get("base_url") or not cfg_b.get("base_url"):
+        return False
+    return cfg_a["base_url"].rstrip("/").lower() == cfg_b["base_url"].rstrip("/").lower()
 
 
 def llm_search_available() -> bool:
@@ -169,8 +203,15 @@ def _build_prompt(query: str, nodes: List[MemoryNode]) -> str:
 
 async def _call_llm_once(
     prompt: str, cfg: dict, max_tokens: int = 512, timeout: float = 30.0,
-) -> Optional[List[int]]:
-    """Single LLM call — no retry.  Returns parsed node IDs or None."""
+) -> tuple:
+    """Single LLM call — no retry.
+
+    Returns:
+        (node_ids, reason) tuple:
+        - On success: ([1, 3, 7], "ok")
+        - On failure: (None, "timeout" | "http_429" | "http_500" |
+                       "empty_response" | "parse_error" | "network_error")
+    """
     import httpx
 
     url = f"{cfg['base_url'].rstrip('/')}/chat/completions"
@@ -185,27 +226,56 @@ async def _call_llm_once(
         "temperature": 0.0,
     }
 
+    # Granular timeouts: 10s connect, caller-specified read timeout
+    http_timeout = httpx.Timeout(
+        connect=min(10.0, timeout),
+        read=timeout,
+        write=10.0,
+        pool=5.0,
+    )
+
     t0 = time.monotonic()
     try:
-        async with httpx.AsyncClient(timeout=timeout) as client:
+        async with httpx.AsyncClient(timeout=http_timeout) as client:
             r = await client.post(url, json=body, headers=headers)
+            if r.status_code >= 500:
+                log.warning("llm_search: LLM returned %d: %s",
+                            r.status_code, r.text[:200])
+                return None, f"http_{r.status_code}"
+            if r.status_code == 429:
+                log.warning("llm_search: LLM rate-limited (429)")
+                return None, "http_429"
             if r.status_code >= 400:
                 log.warning("llm_search: LLM returned %d: %s",
                             r.status_code, r.text[:200])
-                return None
+                return None, f"http_{r.status_code}"
             data = r.json()
+    except httpx.ConnectTimeout:
+        log.warning("llm_search: LLM connect timeout (%.1fs)", timeout)
+        return None, "connect_timeout"
+    except httpx.ReadTimeout:
+        log.warning("llm_search: LLM read timeout (%.1fs)", timeout)
+        return None, "read_timeout"
+    except httpx.TimeoutException as e:
+        log.warning("llm_search: LLM timeout: %s", e)
+        return None, "timeout"
     except Exception as e:
         log.warning("llm_search: LLM call failed: %s: %s", type(e).__name__, e)
-        return None
+        return None, "network_error"
 
     elapsed = time.monotonic() - t0
     content = _parse_llm_content(data, cfg["model"])
     if content is None:
-        return None
+        return None, "parse_error"
 
     log.info("llm_search: %s responded in %.2fs (%d chars): %s",
              cfg["model"], elapsed, len(content), content[:200])
-    return _parse_node_ids(content)
+    node_ids = _parse_node_ids(content)
+    if node_ids is None:
+        return None, "parse_error"
+    if len(node_ids) == 0:
+        return [], "empty_response"
+    return node_ids, "ok"
 
 
 def _parse_llm_content(data: dict, model: str) -> Optional[str]:
@@ -314,8 +384,10 @@ async def _call_llm(prompt: str, max_tokens: int = 512) -> Optional[List[int]]:
 
     Retry strategy:
       1. Primary LLM: up to _LLM_MAX_RETRIES attempts with exponential backoff
-         (2s → 4s → 8s by default).
-      2. If primary returns empty/error after all retries → try backup LLM once.
+         (2s → 4s → 8s by default). Transient errors (timeout, http_429/500)
+         retry; permanent errors (http_400/401/403) do not.
+      2. If primary fails after all retries → try backup LLM once
+         (skipped if backup uses same provider as primary).
       3. Returns None only if both primary and backup fail.
 
     The caller (llm_rank) falls back to chronological order on None.
@@ -326,39 +398,58 @@ async def _call_llm(prompt: str, max_tokens: int = 512) -> Optional[List[int]]:
         return None
 
     # ── Primary LLM with retry ──
-    last_error: Optional[str] = None
+    last_reason: str = "unknown"
     for attempt in range(1, _LLM_MAX_RETRIES + 1):
-        result = await _call_llm_once(prompt, primary_cfg, max_tokens)
+        result, reason = await _call_llm_once(prompt, primary_cfg, max_tokens)
+        last_reason = reason
+
         if result is not None and len(result) > 0:
             if attempt > 1:
-                log.info("llm_search: primary LLM succeeded on attempt %d/%d",
-                         attempt, _LLM_MAX_RETRIES)
+                log.info("llm_search: primary LLM succeeded on attempt %d/%d "
+                         "(prev errors: %s)",
+                         attempt, _LLM_MAX_RETRIES, last_reason)
             return result
-        if result is not None and len(result) == 0:
-            # LLM explicitly returned empty — this is not a transient error,
-            # but we still retry in case the LLM was being lazy.
-            last_error = "empty response"
-        else:
-            last_error = "error/no parse"
 
         if attempt < _LLM_MAX_RETRIES:
+            # Don't retry permanent client errors (auth, bad request)
+            if reason.startswith("http_4") and reason not in ("http_429",):
+                log.warning("llm_search: primary LLM permanent error (%s) — "
+                            "not retrying", reason)
+                break
+
             delay = _LLM_RETRY_BASE_DELAY_S * (2 ** (attempt - 1))
-            log.info("llm_search: primary LLM %s on attempt %d/%d — retrying in %.1fs",
-                     last_error, attempt, _LLM_MAX_RETRIES, delay)
+            log.info("llm_search: primary LLM attempt %d/%d failed (%s) — "
+                     "retrying in %.1fs",
+                     attempt, _LLM_MAX_RETRIES, reason, delay)
             await asyncio.sleep(delay)
 
-    log.warning("llm_search: primary LLM (%s) failed after %d attempts (%s)",
-                primary_cfg["model"], _LLM_MAX_RETRIES, last_error)
+    log.warning("llm_search: primary LLM (%s) failed after %d attempts "
+                "(last: %s)",
+                primary_cfg["model"], _LLM_MAX_RETRIES, last_reason)
 
     # ── Backup LLM ──
     backup_cfg = _llm_backup_config()
-    if backup_cfg["api_key"] and backup_cfg["base_url"]:
-        log.info("llm_search: trying backup LLM (%s)...", backup_cfg["model"])
-        result = await _call_llm_once(prompt, backup_cfg, max_tokens, timeout=45.0)
-        if result is not None:
-            log.info("llm_search: backup LLM (%s) succeeded", backup_cfg["model"])
-            return result
-        log.warning("llm_search: backup LLM (%s) also failed", backup_cfg["model"])
+    if not (backup_cfg["api_key"] and backup_cfg["base_url"]):
+        log.warning("llm_search: no backup LLM configured")
+        return None
+
+    # Skip backup if same provider as primary (shared failure mode)
+    if _is_same_provider(primary_cfg, backup_cfg):
+        log.warning("llm_search: backup LLM uses same provider as primary "
+                    "(%s) — skipping redundant backup",
+                    backup_cfg["base_url"])
+        return None
+
+    log.info("llm_search: trying backup LLM %s @ %s ...",
+             backup_cfg["model"], backup_cfg["base_url"])
+    result, reason = await _call_llm_once(
+        prompt, backup_cfg, max_tokens, timeout=45.0,
+    )
+    if result is not None and len(result) > 0:
+        log.info("llm_search: backup LLM (%s) succeeded", backup_cfg["model"])
+        return result
+    log.warning("llm_search: backup LLM (%s) also failed (%s)",
+                backup_cfg["model"], reason)
 
     return None
 

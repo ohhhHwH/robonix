@@ -283,9 +283,9 @@ class RememberPipeline:
         # 1. Extract tags
         tags = _rule_based_tag_extraction(log_record, spatial, kv)
 
-        # 2. Generate summary — for path_segment/object_observation, use
-        # the caller-provided message directly (contains structured info).
-        if kv.get("node_type") in ("path_segment", "object_observation"):
+        # 2. Generate summary — for path_segment/object_observation/place/plan,
+        # use the caller-provided message directly (contains structured info).
+        if kv.get("node_type") in ("path_segment", "object_observation", "place", "plan"):
             summary = log_record.msg
         else:
             summary = _generate_summary(log_record, spatial, kv)
@@ -303,6 +303,14 @@ class RememberPipeline:
             embedding_text = summary
             node_type = NodeType.OBJECT_OBSERVATION
             weight = 0.5
+        elif kv.get("node_type") == "place":
+            embedding_text = summary
+            node_type = NodeType.PLACE
+            weight = 0.7  # place nodes are important spatial anchors
+        elif kv.get("node_type") == "plan":
+            embedding_text = summary
+            node_type = NodeType.LONG_TERM  # plan as long-term (reusable)
+            weight = 0.8  # plans are high-value reference points
         else:
             embedding_text = summary
             node_type = NodeType.SHORT_TERM
@@ -381,7 +389,16 @@ class RememberPipeline:
             log.debug("remember: auto-link skipped for node %d: %s",
                       node_id, e)
 
-        # 9. done — plan nodes are handled by early return above;
+        # 9. Text index — lightweight LLM-friendly line
+        try:
+            from ..storage.text_index import get_text_index
+            get_text_index().append(node)
+            log.debug("remember: text_index appended node %d", node_id)
+        except Exception as e:
+            log.debug("remember: text_index skipped for node %d: %s",
+                      node_id, e)
+
+        # 10. done — plan nodes are handled by early return above;
         # non-plan nodes go through graph_store + index pipeline.
 
         log.info("remember: node %d → \"%s\"", node_id, summary)

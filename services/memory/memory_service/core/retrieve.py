@@ -1,25 +1,27 @@
-"""Retrieve pipeline — 3-stage search: TagFilter → Rank → Filters.
+"""Retrieve pipeline — 3-tier search with text index, BM25+LLM rank, and VLM.
 
-Stage 2 ranking has three paths, chosen by availability:
+Tier 1 (text index scan):
+   LLM scans the lightweight text_index.txt -> if it can answer, returns
+   immediately (0 ranker cost).  Otherwise returns a shortlist of
+   relevant node_ids for Tier 2.
 
-  a) LLM credentials set → LLM ranks the full memory graph (default, best quality)
-  b) LLM unavailable, embedding model installed → BM25 + Cosine hybrid
-  c) Neither → chronological fallback (most recent first)
+Tier 2 (tag filter -> rank -> filters):
+   Standard pipeline.  If Tier 1 provided a shortlist, candidate_ids are
+   intersected with it.
 
-Pipeline:
-  1. Tag filter: tag_index.query(tag_filter) → candidate set O(1)
-  2. Rank: llm_rank (LLM default) or vector_store.search (embedding) or chronological
-  3. Causal filter (Phase1: skip, Phase2: check parent nodes are reproducible)
-  4. Time filter: filter by time_range
-  5. Weight sort: weight × score → final ranking
-  6. Fetch full MemoryNode from GraphStore → return
+Tier 3 (VLM feature extraction):
+   When Tier 2 returns low-confidence results and the nodes have images,
+   VLM extracts visual features -> nodes updated -> re-search.
+   Hook point present; full implementation in Module 3+C.
 """
 
 from __future__ import annotations
 
+import json as _json
 import logging
+import os
 import time
-from typing import List, Set
+from typing import List, Optional, Set
 
 from ..storage.graph_store import GraphStore
 from ..storage.tag_index import TagIndex
@@ -31,37 +33,142 @@ from .types import (
 
 log = logging.getLogger("scribe_mem")
 
+# Tier 1 text index scan -- toggle + LLM prompt
+_TIER1_ENABLED = os.environ.get("MEMGRAPH_TIER1_ENABLED", "1") in ("1", "true", "yes")
+
+_TIER1_PROMPT = (
+    "You are a memory index scanner. Given the following text index of memory "
+    "nodes and a question, determine:\n"
+    "1. Can you answer the question directly from the index? If yes, give the answer.\n"
+    "2. If not, which node_ids are most relevant? Return them as a list.\n\n"
+    "Text Index:\n"
+    "{text_index_lines}\n\n"
+    "Question: {user_query}\n\n"
+    "Return JSON: {{\"can_answer\": bool, \"answer\": \"...\", "
+    "\"relevant_node_ids\": [...]}}"
+)
+
+
+async def _tier1_text_index_scan(query: str) -> Optional[dict]:
+    """Scan the text index with an LLM to short-circuit retrieval.
+
+    Returns ``None`` if Tier 1 is disabled, LLM is unavailable, or the
+    call fails.  Otherwise returns a dict with keys ``can_answer``,
+    ``answer``, and ``relevant_node_ids``.
+    """
+    if not _TIER1_ENABLED:
+        return None
+    if not llm_search.llm_search_available():
+        return None
+
+    try:
+        from ..storage.text_index import get_text_index
+        ti = get_text_index()
+        full_text = ti.full_text(max_lines=200)
+        if not full_text.strip():
+            log.debug("tier1: text index empty -- skipping")
+            return None
+        if ti.count() < 3:
+            log.debug("tier1: too few nodes (%d) -- skipping", ti.count())
+            return None
+    except Exception as e:
+        log.debug("tier1: text_index unavailable: %s", e)
+        return None
+
+    prompt = _TIER1_PROMPT.format(
+        text_index_lines=full_text,
+        user_query=query,
+    )
+
+    try:
+        response = await llm_search.llm_json_chat(
+            system_msg="You are a helpful memory index scanner. Return valid JSON only.",
+            user_msg=prompt,
+            temperature=0.0,
+            max_tokens=512,
+        )
+    except Exception as e:
+        log.debug("tier1: LLM call failed: %s", e)
+        return None
+
+    if response is None:
+        return None
+
+    try:
+        result = _json.loads(response) if isinstance(response, str) else response
+        if isinstance(result, dict) and "can_answer" in result:
+            log.info(
+                "tier1: scan -> can_answer=%s, relevant_ids=%d",
+                result.get("can_answer"),
+                len(result.get("relevant_node_ids", [])),
+            )
+            return result
+    except (_json.JSONDecodeError, TypeError):
+        log.debug("tier1: could not parse LLM response: %r", str(response)[:200])
+
+    return None
+
 
 class RetrievePipeline:
     """Orchestrate the search (read) path across all storage layers."""
 
     def __init__(self, graph_store: GraphStore, tag_index: TagIndex,
-                 vector_store: VectorStore):
+                 vector_store: VectorStore,
+                 vlm_extractor=None,  # VLMFeatureExtractor or None
+                 ):
         self._graph = graph_store
         self._tags = tag_index
         self._vectors = vector_store  # kept for optional embedding path
+        self._vlm_extractor = vlm_extractor
 
     async def execute(self, request: SearchRequest) -> SearchResponse:
-        """Execute the search pipeline: TagFilter → LLM rank → filters.
+        """Execute the search pipeline: Tier1 text index -> Tier2 rank -> filters.
 
         Returns:
             SearchResponse with ranked MemoryNode list.
         """
-        # ── Stage 1: Tag filter (O(1) inverted index) ──
+        # ================================================================
+        # Tier 1: Text index scan (LLM short-circuit)
+        # ================================================================
+        tier1_result = await _tier1_text_index_scan(request.query)
+        if tier1_result is not None and tier1_result.get("can_answer"):
+            answer = tier1_result.get("answer", "")
+            if answer:
+                log.info("search: tier1 answered directly -> %r", answer[:120])
+                return SearchResponse(nodes=[], vlm_answer=answer)
+
+        # Tier 1 shortlist -- constrain Tier 2 candidate pool
+        tier1_ids: Optional[Set[int]] = None
+        if tier1_result is not None:
+            rids = tier1_result.get("relevant_node_ids", [])
+            if rids:
+                tier1_ids = {int(n) for n in rids if isinstance(n, (int, float))}
+
+        # ================================================================
+        # Tier 2: Tag filter (O(1) inverted index)
+        # ================================================================
         tag_filter = request.tags or TagFilter()
         candidate_ids = self._tags.query(tag_filter)
+
+        # Intersect with Tier 1 shortlist if available
+        if tier1_ids:
+            candidate_ids = candidate_ids & tier1_ids
+            log.debug("search: tier1 shortlist -> %d candidates (was %d before intersect)",
+                      len(candidate_ids), self._tags.query(tag_filter).__len__()
+                      if False else len(candidate_ids))
+
         if not candidate_ids:
             log.debug("search: tag filter returned empty set")
             return SearchResponse(nodes=[])
 
-        log.debug("search: tag filter → %d candidates", len(candidate_ids))
+        log.debug("search: tag filter -> %d candidates", len(candidate_ids))
 
-        # ── Stage 2: LLM rank (default) → embedding → chronological ──
+        # -- Stage 2: LLM rank (default) -> embedding -> chronological --
         top_k = max(1, request.top_k)
         overfetch = max(top_k * 3, 10)
 
         if llm_search.llm_search_available():
-            # Path A: LLM (default — best quality, works without embedding)
+            # Path A: LLM (default -- best quality, works without embedding)
             log.info("search: using LLM ranker")
             ranked = await llm_search.llm_rank(
                 query=request.query,
@@ -71,7 +178,7 @@ class RetrievePipeline:
             )
         elif self._vectors.is_semantic:
             # Path B: BM25 + Cosine hybrid (embedding model installed)
-            log.info("search: LLM unavailable — using embedding ranker")
+            log.info("search: LLM unavailable -- using embedding ranker")
             ranked = self._vectors.search(
                 query=request.query,
                 candidate_ids=candidate_ids,
@@ -80,16 +187,16 @@ class RetrievePipeline:
             )
         else:
             # Path C: BM25 keyword match, fall back to chronological
-            log.info("search: LLM and embedding unavailable — BM25 keyword")
+            log.info("search: LLM and embedding unavailable -- BM25 keyword")
             ranked = self._vectors.search(
                 query=request.query,
                 candidate_ids=candidate_ids,
                 top_k=overfetch,
-                alpha=1.0,  # pure BM25 — no embedding scores available
+                alpha=1.0,  # pure BM25 -- no embedding scores available
             )
             if not ranked:
                 # Ultimate fallback: most-recent-first
-                log.info("search: BM25 returned empty — chronological")
+                log.info("search: BM25 returned empty -- chronological")
                 nodes = [
                     self._graph.get_node(nid) for nid in candidate_ids
                 ]
@@ -103,10 +210,10 @@ class RetrievePipeline:
         if not ranked:
             return SearchResponse(nodes=[])
 
-        # Build (node_id → hybrid_score) map
+        # Build (node_id -> hybrid_score) map
         score_map = {nid: score for nid, score in ranked}
 
-        # ── Stage 3: Causal expansion ──
+        # -- Stage 3: Causal expansion --
         # For each ranked candidate, pull in its immediate causal parents
         # and children so the VLM sees richer context.
         #
@@ -127,20 +234,20 @@ class RetrievePipeline:
                     post_causal.add(parent_id)
                 for child_id in self._graph.get_children(nid):
                     post_causal.add(child_id)
-            # path_segment → include its VLM-recognized children
+            # path_segment -> include its VLM-recognized children
             elif nt == "path_segment":
                 for child_id in self._graph.get_children(nid):
                     post_causal.add(child_id)
-            # object_observation → include its parent path_segment
+            # object_observation -> include its parent path_segment
             elif nt == "object_observation":
                 for parent_id in self._graph.get_parents(nid):
                     post_causal.add(parent_id)
 
         if len(post_causal) > len(ranked):
-            log.debug("search: causal expansion → %d nodes (was %d)",
+            log.debug("search: causal expansion -> %d nodes (was %d)",
                       len(post_causal), len(ranked))
 
-        # ── Stage 4: Time filter ──
+        # -- Stage 4: Time filter --
         if request.time_range is not None:
             tr = request.time_range
             now = time.time_ns()
@@ -154,7 +261,7 @@ class RetrievePipeline:
             if not post_causal:
                 return SearchResponse(nodes=[])
 
-        # ── Stage 5: Weight sort ──
+        # -- Stage 5: Weight sort --
         final_scores: List[tuple[int, float]] = []
         for nid in post_causal:
             node = self._graph.get_node(nid)
@@ -166,21 +273,70 @@ class RetrievePipeline:
 
         final_scores.sort(key=lambda x: x[1], reverse=True)
 
-        # ── Fetch full nodes ──
+        # -- Fetch full nodes --
         result_nodes: List[MemoryNode] = []
         for nid, _ in final_scores[:top_k]:
             node = self._graph.get_node(nid)
             if node is not None:
                 # Update access metadata (persist to GraphStore so it
-                # survives reboots — used by forget/compact scoring).
+                # survives reboots -- used by forget/compact scoring).
                 node.last_access = time.time_ns()
                 node.access_count += 1
                 self._graph.update_node(nid, node)
                 result_nodes.append(node)
 
-        log.info("search: \"%s\" → %d results", request.query[:60], len(result_nodes))
+        log.info("search: \"%s\" -> %d results", request.query[:60], len(result_nodes))
 
-        # ── Stage 6: VLM QA (optional) ──
+        # ================================================================
+        # Tier 3: VLM feature extraction (Module 3+C)
+        # ================================================================
+        # Trigger VLM to look at node images, extract visual features,
+        # update nodes, and re-search when Tier 1+2 couldn't answer.
+        _tier3_enabled = os.environ.get("MEMGRAPH_TIER3_ENABLED", "0") in ("1", "true", "yes")
+        if _tier3_enabled and not result_nodes and request.vlm_qa:
+            if self._vlm_extractor is not None:
+                log.info("search: tier3 -- triggering VLM feature extraction "
+                         "for query %r", request.query[:80])
+                # Collect candidate nodes that have images
+                img_nodes = []
+                for nid in list(candidate_ids)[:10]:
+                    node = self._graph.get_node(nid)
+                    if node is not None and node.image_refs:
+                        img_nodes.append(node)
+
+                if img_nodes:
+                    # Extract from up to 3 nodes
+                    for node in img_nodes[:3]:
+                        try:
+                            features = await self._vlm_extractor.extract_and_update(
+                                node_id=node.node_id,
+                                query=request.query,
+                                image_paths=node.image_refs,
+                            )
+                            if features is not None and features.get("can_answer_query"):
+                                answer = features.get("answer_to_query", "")
+                                if answer:
+                                    log.info("search: tier3 -> VLM answered: %r",
+                                             answer[:120])
+                                    # Return the enriched node + answer
+                                    result_nodes = [node]
+                                    return SearchResponse(
+                                        nodes=result_nodes,
+                                        vlm_answer=answer,
+                                    )
+                        except Exception as e:
+                            log.debug("search: tier3 extract failed for node %d: %s",
+                                      node.node_id, e)
+
+                    # Re-rank after enrichment (if no direct answer)
+                    if result_nodes:
+                        pass  # already returned above
+                    else:
+                        log.info("search: tier3 -- enrichment done, no direct answer")
+            else:
+                log.info("search: tier3 hook -- VLMFeatureExtractor not configured")
+
+        # -- Stage 6: VLM QA (optional) --
         vlm_answer = ""
         if request.vlm_qa and result_nodes:
             # Collect image paths and build node contexts
@@ -205,7 +361,7 @@ class RetrievePipeline:
                     all_image_refs.extend(n.image_refs)
 
             if all_image_refs or node_ctx:
-                # ── LLM decides: can we answer from text alone? ──
+                # -- LLM decides: can we answer from text alone? --
                 need_image, text_answer = await llm_search.llm_decide_vlm(
                     query=request.query,
                     node_contexts=node_ctx,
@@ -213,9 +369,9 @@ class RetrievePipeline:
                 )
                 if not need_image and text_answer:
                     vlm_answer = text_answer
-                    log.info("search: llm_decide_vlm → answer from text (no VLM)")
+                    log.info("search: llm_decide_vlm -> answer from text (no VLM)")
                 elif all_image_refs:
-                    log.info("search: vlm_qa → %d images, %d contexts for query %r",
+                    log.info("search: vlm_qa -> %d images, %d contexts for query %r",
                              len(all_image_refs), len(node_ctx), request.query[:60])
                     from .observe import vlm_answer_question
                     answer = await vlm_answer_question(
@@ -225,10 +381,10 @@ class RetrievePipeline:
                     )
                     if answer:
                         vlm_answer = answer
-                        log.info("search: vlm_qa answer → %r", answer[:120])
+                        log.info("search: vlm_qa answer -> %r", answer[:120])
                     else:
-                        log.info("search: vlm_qa — VLM unavailable, skipping")
+                        log.info("search: vlm_qa -- VLM unavailable, skipping")
                 else:
-                    log.info("search: vlm_qa — no images to show")
+                    log.info("search: vlm_qa -- no images to show")
 
         return SearchResponse(nodes=result_nodes, vlm_answer=vlm_answer)

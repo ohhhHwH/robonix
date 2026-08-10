@@ -283,14 +283,26 @@ class RememberPipeline:
         # 1. Extract tags
         tags = _rule_based_tag_extraction(log_record, spatial, kv)
 
-        # 2. Generate summary
-        summary = _generate_summary(log_record, spatial, kv)
+        # 2. Generate summary — for path_segment/object_observation, use
+        # the caller-provided message directly (contains structured info).
+        if kv.get("node_type") in ("path_segment", "object_observation"):
+            summary = log_record.msg
+        else:
+            summary = _generate_summary(log_record, spatial, kv)
 
         # 3. Build MemoryNode (without node_id — GraphStore assigns it)
         now = time.time_ns()
         if kv.get("task_type") == "plan":
             # unreachable — handled by early return above
             raise AssertionError("plan should not reach here")
+        elif kv.get("node_type") == "path_segment":
+            embedding_text = summary
+            node_type = NodeType.PATH_SEGMENT
+            weight = 0.6
+        elif kv.get("node_type") == "object_observation":
+            embedding_text = summary
+            node_type = NodeType.OBJECT_OBSERVATION
+            weight = 0.5
         else:
             embedding_text = summary
             node_type = NodeType.SHORT_TERM

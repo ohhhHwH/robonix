@@ -773,6 +773,56 @@ def _start_scene_hook_server() -> None:
                 self._reply(400, {"error": "invalid json"})
                 return
 
+            kv = data.get("kv") if isinstance(data.get("kv"), dict) else {}
+
+            # ── VLMObserver special ops ─────────────────────────────
+            # These bypass the normal remember pipeline — they operate on
+            # existing nodes rather than creating new ones.
+
+            # link_to_existing: add edge parent_node_id → link_to_existing
+            link_target = kv.get("link_to_existing")
+            if link_target is not None:
+                try:
+                    parent_nid = data.get("parent_node_id")
+                    if parent_nid is not None:
+                        _graph.add_edge(int(parent_nid), int(link_target))
+                        log.info("scene_hook.http: link_to_existing: %d → %d",
+                                 int(parent_nid), int(link_target))
+                        self._reply(200, {"node_id": int(link_target)})
+                    else:
+                        self._reply(400, {"error": "link_to_existing requires parent_node_id"})
+                except Exception as e:
+                    log.warning("scene_hook.http: link_to_existing failed: %s", e)
+                    self._reply(500, {"error": str(e)})
+                return
+
+            # append_image_ref: append image to an existing node
+            if kv.get("append_image_ref"):
+                try:
+                    existing_nid = data.get("parent_node_id")
+                    if existing_nid is not None:
+                        nid = int(existing_nid)
+                        node = _graph.get_node(nid)
+                        if node is not None:
+                            img_b64 = data.get("image_base64", "")
+                            if img_b64 and _images is not None:
+                                import base64 as _b64
+                                img_bytes = _b64.b64decode(img_b64)
+                                _images.save(nid, img_bytes)
+                                node.image_refs = _images.list(nid)
+                                _graph.update_node(nid, node)
+                                log.info("scene_hook.http: append_image_ref → node %d (%d images)",
+                                         nid, len(node.image_refs))
+                            self._reply(200, {"node_id": nid})
+                        else:
+                            self._reply(404, {"error": f"node {nid} not found"})
+                    else:
+                        self._reply(400, {"error": "append_image_ref requires parent_node_id"})
+                except Exception as e:
+                    log.warning("scene_hook.http: append_image_ref failed: %s", e)
+                    self._reply(500, {"error": str(e)})
+                return
+
             has_img = "yes" if data.get("image_base64") else "no"
             n_objs = len(data.get("spatial", {}).get("objects", []))
             b64_len = len(data.get("image_base64", ""))

@@ -17,7 +17,7 @@ exploration use-case where the robot moves and new objects appear in
 view continuously.
 
 Env vars:
-  ``SCENE_OBJECT_WATCHDOG`` — set to ``"0"`` to disable (default ``"1"``).
+  ``SCENE_OBJECT_WATCHDOG`` — set to ``"1"`` to enable (default ``"0"``).
   ``OBJECT_WATCHDOG_INTERVAL_S`` — poll interval in seconds (default 2.0).
 """
 

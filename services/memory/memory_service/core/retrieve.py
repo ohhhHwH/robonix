@@ -108,16 +108,35 @@ class RetrievePipeline:
 
         # ── Stage 3: Causal expansion ──
         # For each ranked candidate, pull in its immediate causal parents
-        # and children so the VLM sees richer context.  Expanding both
-        # directions costs little (small fan-out) and helps the VLM
-        # understand why a plan was made or what it led to.
+        # and children so the VLM sees richer context.
+        #
+        # Three tiers:
+        #   - require_executable: full expansion (existing behaviour)
+        #   - path_segment nodes: always expand children (object_observations)
+        #   - object_observation nodes: always expand parents (path_segments)
         post_causal = set(nid for nid, _ in ranked)
-        if request.require_executable:
-            for nid in list(post_causal):
+        for nid in list(post_causal):
+            node = self._graph.get_node(nid)
+            if node is None:
+                continue
+            nt = node.node_type.value if node.node_type else ""
+
+            # Full bidirectional expansion for executable queries
+            if request.require_executable:
                 for parent_id in self._graph.get_parents(nid):
                     post_causal.add(parent_id)
                 for child_id in self._graph.get_children(nid):
                     post_causal.add(child_id)
+            # path_segment → include its VLM-recognized children
+            elif nt == "path_segment":
+                for child_id in self._graph.get_children(nid):
+                    post_causal.add(child_id)
+            # object_observation → include its parent path_segment
+            elif nt == "object_observation":
+                for parent_id in self._graph.get_parents(nid):
+                    post_causal.add(parent_id)
+
+        if len(post_causal) > len(ranked):
             log.debug("search: causal expansion → %d nodes (was %d)",
                       len(post_causal), len(ranked))
 

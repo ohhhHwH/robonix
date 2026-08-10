@@ -23,6 +23,7 @@ class NodeType(Enum):
     SKILL = "skill"             # 9000-9998, protected (unless success rate drops)
     FIXED = "fixed"             # 9999 reserved, permanently protected
     LESSON = "lesson"           # long_term range, forget-protected
+    PLACE = "place"                         # robot stationed at a location
     PATH_SEGMENT = "path_segment"         # robot traversal path
     OBJECT_OBSERVATION = "object_observation"  # VLM object recognition child
 
@@ -73,23 +74,53 @@ class ObjectCoord:
 
 @dataclass
 class SpatialContext:
-    """Spatial context from Scene.list_objects. (§2.3)"""
+    """Spatial context from Scene.list_objects. (§2.3)
+
+    Extended for PlaceNode support with optional ``center``, ``radius_m``,
+    and ``semantic_region`` fields.
+    """
     objects: List[ObjectCoord] = field(default_factory=list)
     origin: str = ""
+    center: Optional[Dict[str, float]] = None   # {"x": 1.0, "y": 2.0, "z": 0.0}
+    radius_m: float = 0.0
+    semantic_region: str = ""
 
     def __post_init__(self) -> None:
         """Reject coordinates whose reference frame was not supplied."""
         self.origin = str(self.origin or "").strip()
+        # PlaceNode spatial may have center but no objects — relax validation
         if self.objects and not self.origin:
             raise ValueError("spatial origin frame is required when objects are present")
 
     def to_dict(self) -> Dict[str, Any]:
-        return {"objects": [o.to_dict() for o in self.objects], "origin": self.origin}
+        d: Dict[str, Any] = {
+            "objects": [o.to_dict() for o in self.objects],
+            "origin": self.origin,
+        }
+        if self.center is not None:
+            d["center"] = dict(self.center)
+        if self.radius_m > 0:
+            d["radius_m"] = self.radius_m
+        if self.semantic_region:
+            d["semantic_region"] = self.semantic_region
+        return d
 
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> "SpatialContext":
         objects = [ObjectCoord.from_dict(o) for o in d.get("objects", [])]
-        return cls(objects=objects, origin=d.get("origin", ""))
+        center = d.get("center")
+        if isinstance(center, dict):
+            center = {"x": float(center.get("x", 0)), "y": float(center.get("y", 0)),
+                      "z": float(center.get("z", 0))}
+        else:
+            center = None
+        return cls(
+            objects=objects,
+            origin=d.get("origin", ""),
+            center=center,
+            radius_m=float(d.get("radius_m", 0)),
+            semantic_region=str(d.get("semantic_region", "")),
+        )
 
 
 @dataclass

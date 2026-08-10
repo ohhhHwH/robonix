@@ -229,6 +229,58 @@ async def _call_llm(prompt: str, max_tokens: int = 512) -> Optional[List[int]]:
     return None
 
 
+# ── Generic JSON chat (Tier 1 text index scan, etc.) ────────────────────
+
+async def llm_json_chat(
+    system_msg: str,
+    user_msg: str,
+    temperature: float = 0.0,
+    max_tokens: int = 512,
+) -> Optional[str]:
+    """Send a *system_msg* + *user_msg* to the LLM and return the raw
+    text content.  Used by Tier 1 text index scanner and other
+    lightweight LLM calls that don't need node formatting.
+
+    Returns ``None`` on any failure.
+    """
+    cfg = _llm_config()
+    if not cfg["api_key"] or not cfg["base_url"]:
+        return None
+
+    import httpx
+
+    url = f"{cfg['base_url'].rstrip('/')}/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {cfg['api_key']}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "model": cfg["model"],
+        "messages": [
+            {"role": "system", "content": system_msg},
+            {"role": "user", "content": user_msg},
+        ],
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+    }
+
+    try:
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(connect=5.0, read=20.0),
+        ) as client:
+            r = await client.post(url, json=payload, headers=headers)
+        if r.status_code >= 400:
+            log.warning("llm_json_chat: LLM returned %d: %s",
+                        r.status_code, r.text[:200])
+            return None
+        data = r.json()
+        return data["choices"][0]["message"]["content"].strip()
+    except Exception as e:
+        log.warning("llm_json_chat: LLM call failed: %s: %s",
+                    type(e).__name__, e)
+        return None
+
+
 # ── Search entry point ─────────────────────────────────────────────────────
 
 async def llm_rank(

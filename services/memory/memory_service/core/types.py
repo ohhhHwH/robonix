@@ -63,13 +63,19 @@ class ObjectCoord:
     x: float = 0.0
     y: float = 0.0
     z: float = 0.0
+    label_zh: str = ""              # bilingual label (dataset spec); fallback = label
+    label_en: str = ""              # bilingual label (dataset spec); fallback = label
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
 
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> "ObjectCoord":
-        return cls(**{k: v for k, v in d.items() if k in cls.__dataclass_fields__})
+        valid = {k: v for k, v in d.items() if k in cls.__dataclass_fields__}
+        label = valid.get("label", "")
+        valid.setdefault("label_zh", label)
+        valid.setdefault("label_en", label)
+        return cls(**valid)
 
 
 @dataclass
@@ -124,6 +130,52 @@ class SpatialContext:
 
 
 @dataclass
+class CameraPose:
+    """相机在 world 系中的位姿（四元数 + 平移）。"""
+    x: float = 0.0
+    y: float = 0.0
+    z: float = 0.0
+    qx: float = 0.0
+    qy: float = 0.0
+    qz: float = 0.0
+    qw: float = 1.0
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, d: Dict[str, Any]) -> "CameraPose":
+        valid = {k: v for k, v in d.items() if k in cls.__dataclass_fields__}
+        return cls(**valid)
+
+
+@dataclass
+class CameraParams:
+    """针孔内参 + 深度换算 + 相机类型 + 当前位姿（对齐 datasets-struct.md）。"""
+    fx: float = 0.0
+    fy: float = 0.0
+    cx: float = 0.0
+    cy: float = 0.0
+    width: int = 0
+    height: int = 0
+    depth_scale: float = 0.001
+    camera_type: str = "rgb"
+    camera_pose: Optional[CameraPose] = None
+
+    def to_dict(self) -> Dict[str, Any]:
+        d = {k: v for k, v in asdict(self).items()}
+        d["camera_pose"] = self.camera_pose.to_dict() if self.camera_pose else None
+        return d
+
+    @classmethod
+    def from_dict(cls, d: Dict[str, Any]) -> "CameraParams":
+        pose = CameraPose.from_dict(d["camera_pose"]) if d.get("camera_pose") else None
+        valid = {k: v for k, v in d.items()
+                 if k in cls.__dataclass_fields__ and k != "camera_pose"}
+        return cls(camera_pose=pose, **valid)
+
+
+@dataclass
 class TagSet:
     """Four-dimension tag set for inverted-index filtering. (§2.2)
 
@@ -146,6 +198,8 @@ class TagSet:
     task_type: str = ""             # fetch / build / explore / dialogue
     difficulty: str = "medium"     # easy / medium / hard
     intent: str = ""               # LLM intent short-label
+    intent_zh: str = ""            # bilingual intent (dataset spec); fallback = intent
+    intent_en: str = ""            # bilingual intent (dataset spec); fallback = intent
 
     # Optimisation (forget scoring, not retrieval)
     frequency: int = 0
@@ -162,6 +216,10 @@ class TagSet:
         for list_field in ("objects_present", "tool_used"):
             if list_field in valid and valid[list_field] is None:
                 valid[list_field] = []
+        # Bilingual intent fallback: missing zh/en → backfill from intent
+        intent = valid.get("intent", "")
+        valid.setdefault("intent_zh", intent)
+        valid.setdefault("intent_en", intent)
         return cls(**valid)
 
 
@@ -190,11 +248,15 @@ class MemoryNode:
 
     # Content
     summary: str = ""               # LLM one-liner; retrieval ranking basis
+    summary_zh: str = ""            # bilingual summary (P0 backfill from summary)
+    summary_en: str = ""            # bilingual summary (P0 backfill from summary)
     raw_log: Optional[LogRecord] = None
 
     # Spatiotemporal
     timestamp: int = 0              # chronos ns
     spatial_data: Optional[SpatialContext] = None
+    time_range: Optional[TimeRange] = None       # observation window [start_ts, end_ts] ns
+    camera_params: Optional[CameraParams] = None  # capture intrinsics + pose
 
     # Tags (4-dim)
     tags: Optional[TagSet] = None
@@ -211,6 +273,12 @@ class MemoryNode:
     # Images (patrol / inspection demo)
     image_refs: List[str] = field(default_factory=list)  # paths relative to data/
 
+    # Dataset-spec media refs (P0: serializable placeholders, no binary persistence)
+    depth_refs: List[str] = field(default_factory=list)     # depth image paths (P1 persistence)
+    frame_ts: List[int] = field(default_factory=list)        # per-frame capture timestamps (ns)
+    video_clip_refs: List[str] = field(default_factory=list) # video clip paths
+    confidence_flags: Dict[str, float] = field(default_factory=dict)  # per-field confidence
+
     # Metadata
     node_type: NodeType = NodeType.SHORT_TERM
     created_at: int = 0
@@ -222,9 +290,16 @@ class MemoryNode:
         d: Dict[str, Any] = {}
         d["node_id"] = self.node_id
         d["summary"] = self.summary
+        d["summary_zh"] = self.summary_zh
+        d["summary_en"] = self.summary_en
         d["raw_log"] = self.raw_log.to_dict() if self.raw_log else None
         d["timestamp"] = self.timestamp
         d["spatial_data"] = self.spatial_data.to_dict() if self.spatial_data else None
+        d["time_range"] = (
+            {"start_ts": self.time_range.start_ts, "end_ts": self.time_range.end_ts}
+            if self.time_range else None
+        )
+        d["camera_params"] = self.camera_params.to_dict() if self.camera_params else None
         d["tags"] = self.tags.to_dict() if self.tags else None
         d["causal_chain"] = list(self.causal_chain)
         d["weight"] = self.weight
@@ -235,6 +310,10 @@ class MemoryNode:
         d["access_count"] = self.access_count
         d["version"] = self.version
         d["image_refs"] = list(self.image_refs)
+        d["depth_refs"] = list(self.depth_refs)
+        d["frame_ts"] = list(self.frame_ts)
+        d["video_clip_refs"] = list(self.video_clip_refs)
+        d["confidence_flags"] = dict(self.confidence_flags)
         return d
 
     @classmethod
@@ -243,12 +322,26 @@ class MemoryNode:
         spatial = SpatialContext.from_dict(d["spatial_data"]) if d.get("spatial_data") else None
         tags = TagSet.from_dict(d["tags"]) if d.get("tags") else None
         node_type = NodeType(d.get("node_type", "short_term"))
+        time_range = None
+        if d.get("time_range"):
+            tr = d["time_range"]
+            time_range = TimeRange(
+                start_ts=int(tr.get("start_ts", 0)),
+                end_ts=int(tr.get("end_ts", 0)),
+            )
+        camera_params = (
+            CameraParams.from_dict(d["camera_params"]) if d.get("camera_params") else None
+        )
         return cls(
             node_id=d.get("node_id", 0),
             summary=d.get("summary", ""),
+            summary_zh=d.get("summary_zh", ""),
+            summary_en=d.get("summary_en", ""),
             raw_log=raw_log,
             timestamp=d.get("timestamp", 0),
             spatial_data=spatial,
+            time_range=time_range,
+            camera_params=camera_params,
             tags=tags,
             causal_chain=d.get("causal_chain", []),
             weight=d.get("weight", 0.5),
@@ -259,6 +352,10 @@ class MemoryNode:
             access_count=d.get("access_count", 0),
             version=d.get("version", 1),
             image_refs=d.get("image_refs", []),
+            depth_refs=d.get("depth_refs", []),
+            frame_ts=d.get("frame_ts", []),
+            video_clip_refs=d.get("video_clip_refs", []),
+            confidence_flags=d.get("confidence_flags", {}),
         )
 
 
@@ -369,6 +466,9 @@ class RememberRequest:
     spatial: Optional[SpatialContext] = None
     parent_node_id: Optional[int] = None
     image_base64: str = ""           # top-level: camera frame as base64
+    depth_base64: str = ""           # top-level: depth frame as base64 (P0: received, not persisted)
+    camera_params: Optional[CameraParams] = None  # capture intrinsics + pose
+    time_range: Optional[TimeRange] = None        # observation window [start_ts, end_ts] ns
     kv: Dict[str, str] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
@@ -379,18 +479,38 @@ class RememberRequest:
             "spatial": self.spatial.to_dict() if self.spatial else None,
             "parent_node_id": self.parent_node_id,
             "image_base64": self.image_base64,
+            "depth_base64": self.depth_base64,
+            "camera_params": self.camera_params.to_dict() if self.camera_params else None,
+            "time_range": (
+                {"start_ts": self.time_range.start_ts, "end_ts": self.time_range.end_ts}
+                if self.time_range else None
+            ),
             "kv": self.kv,
         }
 
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> "RememberRequest":
         spatial = SpatialContext.from_dict(d["spatial"]) if d.get("spatial") else None
+        camera_params = (
+            CameraParams.from_dict(d["camera_params"]) if d.get("camera_params") else None
+        )
+        time_range = None
+        if d.get("time_range"):
+            tr = d["time_range"]
+            time_range = TimeRange(
+                start_ts=int(tr.get("start_ts", 0)),
+                end_ts=int(tr.get("end_ts", 0)),
+            )
         return cls(
             session_id=d.get("session_id", ""),
             plan_id=d.get("plan_id", ""),
             log_record=LogRecord.from_dict(d.get("log_record", {})),
             spatial=spatial,
             parent_node_id=d.get("parent_node_id"),
+            image_base64=d.get("image_base64", ""),
+            depth_base64=d.get("depth_base64", ""),
+            camera_params=camera_params,
+            time_range=time_range,
             kv=d.get("kv", {}),
         )
 

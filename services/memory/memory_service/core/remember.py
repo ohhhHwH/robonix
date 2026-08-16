@@ -14,6 +14,7 @@ Pipeline:
 
 from __future__ import annotations
 
+import json
 import logging
 import time
 from typing import List, Optional
@@ -215,6 +216,22 @@ def _generate_summary(log_record: LogRecord,
         return f"{outcome} {action} in {scene}"
 
 
+def _kv_json_load(raw, default):
+    """Parse a kv field that may be a JSON string or a native value.
+
+    Returns *default* when raw is empty or unparseable, so malformed
+    dataset fields degrade to an empty collection instead of raising.
+    """
+    if raw is None or raw == "":
+        return default
+    if not isinstance(raw, str):
+        return raw  # already a native list/dict
+    try:
+        return json.loads(raw)
+    except (TypeError, ValueError):
+        return default
+
+
 # ── Pipeline ────────────────────────────────────────────────────────────
 
 class RememberPipeline:
@@ -318,23 +335,43 @@ class RememberPipeline:
 
         embedding = self._vectors.encode(embedding_text, modality="text")
 
+        # ── Dataset-spec media refs (P0) from kv JSON strings ──
+        depth_refs = _kv_json_load(kv.get("depth_refs"), [])
+        frame_ts = _kv_json_load(kv.get("frame_ts"), [])
+        video_clip_refs = _kv_json_load(kv.get("video_clip_refs"), [])
+        confidence_flags = _kv_json_load(kv.get("confidence_flags"), {})
+
         node = MemoryNode(
             node_id=0,  # GraphStore will assign
             summary=summary,
+            summary_zh=summary,  # P0: bilingual backfill from single summary
+            summary_en=summary,  # P0: bilingual backfill from single summary
             raw_log=log_record,
             timestamp=log_record.ts or now,
             spatial_data=spatial,
+            time_range=request.time_range,
+            camera_params=request.camera_params,
             tags=tags,
             weight=weight,
             embedding=embedding,
             node_type=node_type,
             created_at=now,
             version=1,
+            depth_refs=depth_refs,
+            frame_ts=frame_ts,
+            video_clip_refs=video_clip_refs,
+            confidence_flags=confidence_flags,
         )
 
         # 4. Persist to GraphStore first to get node_id
         node_id = self._graph.add_node(node)
         node.node_id = node_id
+
+        # 4b. Depth frame (P0: received but NOT persisted — depth binary
+        # persistence is P1 to avoid coupling with ImageStore changes).
+        if request.depth_base64:
+            log.info("remember: node %d depth_base64 received (%d chars) — "
+                     "not persisted (P0)", node_id, len(request.depth_base64))
 
         # 5. Save image if provided (top-level image_base64 or kv fallback)
         img_b64 = request.image_base64 or request.kv.get("image_base64", "")

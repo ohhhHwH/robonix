@@ -393,7 +393,7 @@ class ObjectWatchdog:
                                 obj.cls)
                     continue
                 self._mark_seen(obj)
-                ok = await self._save_object(obj, img_b64)
+                ok = await self._save_object(obj, img_b64, w, h)
                 if ok:
                     key = self._grid_key(obj)
                     self._grid_img_count[key] = 1
@@ -546,6 +546,46 @@ class ObjectWatchdog:
         v = int(fy * oy / oz + cy)
         return max(0, min(img_w - 1, u)), max(0, min(img_h - 1, v))
 
+    def _build_camera_params(self, img_w: int, img_h: int) -> Dict[str, Any]:
+        """Assemble camera_params for a remember payload (dataset spec).
+
+        Intrinsics mirror ``_project_to_pixel`` (fallback fx=fy=554,
+        cx=img_w/2, cy=img_h/2).  Pose uses camera→map tf; only yaw is
+        available via ``lookup_xy_yaw``, so the quaternion is built as
+        qz=sin(yaw/2), qw=cos(yaw/2) with the other components zero.
+        """
+        fx = fy = 554.0
+        cx, cy = img_w / 2.0, img_h / 2.0
+        if self._hub is not None and self._hub.has("intrinsics"):
+            intr_msg, _, _ = self._hub.latest("intrinsics")
+            if intr_msg is not None:
+                k = getattr(intr_msg, 'k', ())
+                if len(k) >= 4:
+                    fx, fy, cx, cy = float(k[0]), float(k[4]), float(k[2]), float(k[5])
+
+        camera_pose: Optional[Dict[str, float]] = None
+        if self._hub is not None:
+            cam_frame = os.environ.get(
+                "SCENE_CAMERA_FRAME", "head_front_camera_rgb_optical_frame"
+            )
+            pose = self._hub.lookup_xy_yaw(cam_frame, "map")
+            if pose is not None:
+                cam_x, cam_y, cam_z, cam_yaw = pose
+                camera_pose = {
+                    "x": float(cam_x), "y": float(cam_y), "z": float(cam_z),
+                    "qx": 0.0, "qy": 0.0,
+                    "qz": math.sin(cam_yaw / 2.0),
+                    "qw": math.cos(cam_yaw / 2.0),
+                }
+
+        return {
+            "fx": fx, "fy": fy, "cx": cx, "cy": cy,
+            "width": int(img_w), "height": int(img_h),
+            "depth_scale": 0.001,
+            "camera_type": "rgb",
+            "camera_pose": camera_pose,
+        }
+
     # ── Room/region lookup ─────────────────────────────────────────────
 
     def _lookup_region(self, x: float, y: float) -> str:
@@ -561,7 +601,8 @@ class ObjectWatchdog:
 
     # ── POST to memgraph ───────────────────────────────────────────────
 
-    async def _save_object(self, obj, img_b64: str) -> bool:
+    async def _save_object(self, obj, img_b64: str,
+                           img_w: int = 0, img_h: int = 0) -> bool:
         """POST a single-object remember request to the memgraph Scene Hook."""
         import httpx
 
@@ -577,6 +618,7 @@ class ObjectWatchdog:
         region = self._lookup_region(ox, oy)
         if region:
             log.info("object_watchdog: %s@%.1f,%.1f → region=%s", obj.cls, ox, oy, region)
+        camera_params = self._build_camera_params(img_w, img_h) if img_w and img_h else None
         payload: Dict[str, Any] = {
             "session_id": "scene-watchdog",
             "plan_id": "scene-watchdog",
@@ -599,6 +641,9 @@ class ObjectWatchdog:
                 ],
             },
             "image_base64": img_b64,
+            "depth_base64": "",  # P0: no depth capture, field placeholder
+            "camera_params": camera_params,
+            "time_range": {"start_ts": now_ns, "end_ts": now_ns},
             "kv": {"region": region} if region else {},
         }
 
@@ -660,6 +705,7 @@ class ObjectWatchdog:
             },
             "image_base64": img_b64,
             "parent_node_id": node_id,
+            "time_range": {"start_ts": now_ns, "end_ts": now_ns},
         }
 
         try:

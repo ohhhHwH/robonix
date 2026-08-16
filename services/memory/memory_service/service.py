@@ -61,6 +61,7 @@ def _log_environment() -> None:
 from .core.types import (  # noqa: E402
     LogRecord, SpatialContext, ObjectCoord,
     TagFilter, TimeRange, RememberRequest, SearchRequest,
+    CameraParams,
 )
 from .storage.graph_store import GraphStore  # noqa: E402
 from .storage.tag_index import TagIndex  # noqa: E402
@@ -373,6 +374,18 @@ if _MCP_AVAILABLE:
           },
           "parent_node_id": 5,           // optional — causal parent
           "image_base64": "<base64>",    // optional — manual image attach
+          "depth_base64": "<base64>",    // optional — depth frame (P0: logged, not persisted)
+          "camera_params": {             // optional — capture intrinsics + pose
+            "fx": 554.0, "fy": 554.0, "cx": 320.0, "cy": 240.0,
+            "width": 640, "height": 480,
+            "depth_scale": 0.001, "camera_type": "rgb",
+            "camera_pose": {"x": 0.0, "y": 0.0, "z": 0.0,
+                            "qx": 0.0, "qy": 0.0, "qz": 0.0, "qw": 1.0}
+          },
+          "time_range": {                 // optional — observation window (ns)
+            "start_ts": 1765432100123456789,
+            "end_ts":   1765432100123456789
+          },
           "kv": {}                        // optional — extra metadata
         }
 
@@ -419,6 +432,24 @@ if _MCP_AVAILABLE:
             except Exception as e:
                 return _json_error(f"Invalid spatial: {e}", ctx="remember")
 
+        camera_params = None
+        if req_dict.get("camera_params"):
+            try:
+                camera_params = CameraParams.from_dict(req_dict["camera_params"])
+            except Exception as e:
+                return _json_error(f"Invalid camera_params: {e}", ctx="remember")
+
+        time_range = None
+        if req_dict.get("time_range"):
+            try:
+                tr = req_dict["time_range"]
+                time_range = TimeRange(
+                    start_ts=int(tr.get("start_ts", 0)),
+                    end_ts=int(tr.get("end_ts", 0)),
+                )
+            except (TypeError, ValueError) as e:
+                return _json_error(f"Invalid time_range: {e}", ctx="remember")
+
         request = RememberRequest(
             session_id=session_id,
             plan_id=plan_id,
@@ -426,6 +457,9 @@ if _MCP_AVAILABLE:
             spatial=spatial,
             parent_node_id=req_dict.get("parent_node_id"),
             image_base64=req_dict.get("image_base64", ""),
+            depth_base64=req_dict.get("depth_base64", ""),
+            camera_params=camera_params,
+            time_range=time_range,
             kv=req_dict.get("kv") if isinstance(req_dict.get("kv"), dict) else {},
         )
         resp = await _remember_pipe.execute(request)
@@ -837,6 +871,18 @@ def _start_scene_hook_server() -> None:
                 if data.get("spatial"):
                     spatial = SpatialContext.from_dict(data["spatial"])
 
+                # ── dataset-spec fields (camera_params/time_range/depth) ──
+                camera_params = None
+                if data.get("camera_params"):
+                    camera_params = CameraParams.from_dict(data["camera_params"])
+                time_range = None
+                if data.get("time_range"):
+                    tr = data["time_range"]
+                    time_range = TimeRange(
+                        start_ts=int(tr.get("start_ts", 0)),
+                        end_ts=int(tr.get("end_ts", 0)),
+                    )
+
                 # ── dedup: reuse existing node for same object+position ──
                 existing_nid = _find_existing_node(spatial, data.get("image_base64", ""))
                 if existing_nid is not None:
@@ -851,6 +897,9 @@ def _start_scene_hook_server() -> None:
                     spatial=spatial,
                     parent_node_id=data.get("parent_node_id"),
                     image_base64=data.get("image_base64", ""),
+                    depth_base64=data.get("depth_base64", ""),
+                    camera_params=camera_params,
+                    time_range=time_range,
                     kv=data.get("kv") if isinstance(data.get("kv"), dict) else {},
                 )
                 t_pipe = time.time()

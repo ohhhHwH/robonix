@@ -382,6 +382,14 @@ class TimeRange:
     start_ts: int = 0
     end_ts: int = 0                 # 0 = no upper bound (use current time)
 
+    def to_dict(self) -> Dict[str, Any]:
+        return {"start_ts": self.start_ts, "end_ts": self.end_ts}
+
+    @classmethod
+    def from_dict(cls, d: Dict[str, Any]) -> "TimeRange":
+        return cls(start_ts=int(d.get("start_ts", 0)),
+                   end_ts=int(d.get("end_ts", 0)))
+
 
 @dataclass
 class TagFilter:

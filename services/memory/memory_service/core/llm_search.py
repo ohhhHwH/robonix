@@ -14,12 +14,21 @@ LLM endpoint configuration (env vars, in precedence order):
   MEMGRAPH_LLM_API_KEY   >  VLM_API_KEY   >  OPENAI_API_KEY
   MEMGRAPH_LLM_MODEL     >  VLM_MODEL     >  OPENAI_MODEL  >  "gpt-4.1"
 
+Backup LLM (tried when primary returns empty after retries):
+  MEMGRAPH_LLM_BACKUP_BASE_URL / API_KEY / MODEL
+
+Retry behaviour:
+  - Primary LLM: up to 3 attempts with exponential backoff (2s → 4s → 8s)
+  - If primary returns empty/error after all retries → try backup LLM once
+  - If backup also fails → caller falls back to BM25/chronological
+
 If no LLM credentials are available the pipeline falls back to the
 deterministic hash embedding (non-semantic, same-text → same-vector).
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -31,6 +40,11 @@ from .types import MemoryNode
 log = logging.getLogger("scribe_mem")
 
 # ── LLM configuration ──────────────────────────────────────────────────────
+
+# Retry settings (env-overridable)
+_LLM_MAX_RETRIES = int(os.environ.get("MEMGRAPH_LLM_RETRIES", "3"))
+_LLM_RETRY_BASE_DELAY_S = float(os.environ.get("MEMGRAPH_LLM_RETRY_BASE_S", "2.0"))
+
 
 def _llm_config() -> dict:
     """Resolve LLM endpoint from env vars with standard fallbacks.
@@ -56,6 +70,49 @@ def _llm_config() -> dict:
         or "gpt-4.1"
     )
     return {"base_url": base_url, "api_key": api_key, "model": model}
+
+
+def _llm_backup_config() -> dict:
+    """Resolve backup LLM endpoint (tried when primary returns empty).
+
+    Priority:
+      1. MEMGRAPH_BACKUP_LLM_*  — dedicated backup provider (new)
+      2. MEMGRAPH_LLM_BACKUP_*  — legacy backup vars
+      3. MEM_VLM_*              — Aliyun qwen VLM endpoint (last resort)
+    """
+    # Tier 1: dedicated backup
+    base_url = os.environ.get("MEMGRAPH_BACKUP_LLM_URL", "")
+    api_key = os.environ.get("MEMGRAPH_BACKUP_LLM_KEY", "")
+    model = os.environ.get("MEMGRAPH_BACKUP_LLM_MODEL", "")
+    if base_url and api_key:
+        return {"base_url": base_url, "api_key": api_key,
+                "model": model or "qwen3.6-flash"}
+
+    # Tier 2: legacy backup vars
+    base_url = os.environ.get("MEMGRAPH_LLM_BACKUP_BASE_URL", "")
+    api_key = os.environ.get("MEMGRAPH_LLM_BACKUP_API_KEY", "")
+    model = os.environ.get("MEMGRAPH_LLM_BACKUP_MODEL", "")
+    if base_url and api_key:
+        return {"base_url": base_url, "api_key": api_key,
+                "model": model or "gpt-4.1"}
+
+    # Tier 3: VLM endpoint as last resort (Aliyun qwen / compatible)
+    vlm_url = os.environ.get("MEM_VLM_BASE_URL", "")
+    vlm_key = os.environ.get("MEM_VLM_API_KEY", "")
+    vlm_model = os.environ.get("MEM_VLM_MODEL", "")
+    if vlm_url and vlm_key:
+        log.debug("llm_search: using VLM endpoint as backup LLM (%s)", vlm_model)
+        return {"base_url": vlm_url, "api_key": vlm_key,
+                "model": vlm_model or "qwen3.6-flash"}
+
+    return {"base_url": "", "api_key": "", "model": ""}
+
+
+def _is_same_provider(cfg_a: dict, cfg_b: dict) -> bool:
+    """Check whether two LLM configs point to the same API endpoint."""
+    if not cfg_a.get("base_url") or not cfg_b.get("base_url"):
+        return False
+    return cfg_a["base_url"].rstrip("/").lower() == cfg_b["base_url"].rstrip("/").lower()
 
 
 def llm_search_available() -> bool:
@@ -142,21 +199,19 @@ def _build_prompt(query: str, nodes: List[MemoryNode]) -> str:
     )
 
 
-# ── LLM caller ─────────────────────────────────────────────────────────────
+# ── LLM caller (with retry + backup) ────────────────────────────────────────
 
-async def _call_llm(prompt: str, max_tokens: int = 512) -> Optional[List[int]]:
-    """Send prompt to the LLM, parse the JSON response for node IDs.
+async def _call_llm_once(
+    prompt: str, cfg: dict, max_tokens: int = 512, timeout: float = 30.0,
+) -> tuple:
+    """Single LLM call — no retry.
 
-    Follows the same httpx + env-var pattern as Scene's SceneGraphLLMClient
-    (system/scene/scene_service/scene_graph/llm_client.py).
-
-    Returns None on any failure — the caller falls back to chronological order.
+    Returns:
+        (node_ids, reason) tuple:
+        - On success: ([1, 3, 7], "ok")
+        - On failure: (None, "timeout" | "http_429" | "http_500" |
+                       "empty_response" | "parse_error" | "network_error")
     """
-    cfg = _llm_config()
-    if not cfg["api_key"] or not cfg["base_url"]:
-        log.debug("llm_search: no LLM credentials — skipping")
-        return None
-
     import httpx
 
     url = f"{cfg['base_url'].rstrip('/')}/chat/completions"
@@ -171,58 +226,101 @@ async def _call_llm(prompt: str, max_tokens: int = 512) -> Optional[List[int]]:
         "temperature": 0.0,
     }
 
+    # Granular timeouts: 10s connect, caller-specified read timeout
+    http_timeout = httpx.Timeout(
+        connect=min(10.0, timeout),
+        read=timeout,
+        write=10.0,
+        pool=5.0,
+    )
+
     t0 = time.monotonic()
     try:
-        async with httpx.AsyncClient(timeout=30.0) as client:
+        async with httpx.AsyncClient(timeout=http_timeout) as client:
             r = await client.post(url, json=body, headers=headers)
+            if r.status_code >= 500:
+                log.warning("llm_search: LLM returned %d: %s",
+                            r.status_code, r.text[:200])
+                return None, f"http_{r.status_code}"
+            if r.status_code == 429:
+                log.warning("llm_search: LLM rate-limited (429)")
+                return None, "http_429"
             if r.status_code >= 400:
                 log.warning("llm_search: LLM returned %d: %s",
                             r.status_code, r.text[:200])
-                return None
+                return None, f"http_{r.status_code}"
             data = r.json()
+    except httpx.ConnectTimeout:
+        log.warning("llm_search: LLM connect timeout (%.1fs)", timeout)
+        return None, "connect_timeout"
+    except httpx.ReadTimeout:
+        log.warning("llm_search: LLM read timeout (%.1fs)", timeout)
+        return None, "read_timeout"
+    except httpx.TimeoutException as e:
+        log.warning("llm_search: LLM timeout: %s", e)
+        return None, "timeout"
     except Exception as e:
         log.warning("llm_search: LLM call failed: %s: %s", type(e).__name__, e)
-        return None
+        return None, "network_error"
 
     elapsed = time.monotonic() - t0
-    content = ""
+    content = _parse_llm_content(data, cfg["model"])
+    if content is None:
+        return None, "parse_error"
+
+    log.info("llm_search: %s responded in %.2fs (%d chars): %s",
+             cfg["model"], elapsed, len(content), content[:200])
+    node_ids = _parse_node_ids(content)
+    if node_ids is None:
+        return None, "parse_error"
+    if len(node_ids) == 0:
+        return [], "empty_response"
+    return node_ids, "ok"
+
+
+def _parse_llm_content(data: dict, model: str) -> Optional[str]:
+    """Extract message content from LLM response dict."""
     try:
         content = data["choices"][0]["message"]["content"]
+        return content.strip() if content else None
     except (KeyError, IndexError, TypeError):
-        log.warning("llm_search: unexpected LLM response shape")
+        log.warning("llm_search: unexpected LLM response shape from %s", model)
         return None
 
-    log.info("llm_search: LLM responded in %.2fs (%d chars): %s",
-             elapsed, len(content), content[:200])
 
-    # Parse the JSON from the LLM response.
-    # Be tolerant: strip markdown fences, look for the first '{'.
-    content = content.strip()
-    if content.startswith("```"):
-        # Strip ```json / ``` fences
-        lines = content.split("\n")
-        content = "\n".join(
+def _parse_node_ids(content: str) -> Optional[List[int]]:
+    """Parse a JSON array of node IDs from LLM text output.
+
+    Tolerant: strips markdown fences, tries regex fallback.
+    """
+    text = content.strip()
+    if text.startswith("```"):
+        lines = text.split("\n")
+        text = "\n".join(
             l for l in lines if not l.strip().startswith("```")
         ).strip()
 
+    # Try direct JSON parse
     try:
-        result = json.loads(content)
+        result = json.loads(text)
         ids = result.get("nodes", [])
         if isinstance(ids, list) and all(isinstance(i, int) for i in ids):
             log.info("llm_search: LLM selected node IDs: %s", ids)
             return ids  # type: ignore[return-value]
     except json.JSONDecodeError:
-        # Try to extract a JSON array with a regex as last resort
-        import re
-        m = re.search(r'\[[\d,\s]+\]', content)
-        if m:
-            try:
-                ids = json.loads(m.group())
-                if isinstance(ids, list):
-                    log.info("llm_search: LLM selected node IDs (regex): %s", ids)
-                    return ids  # type: ignore[return-value]
-            except json.JSONDecodeError:
-                pass
+        pass
+
+    # Regex fallback: find the first JSON array of ints
+    import re
+    m = re.search(r'\[[\d,\s]+\]', text)
+    if m:
+        try:
+            ids = json.loads(m.group())
+            if isinstance(ids, list) and ids:
+                log.info("llm_search: LLM selected node IDs (regex): %s", ids)
+                return ids  # type: ignore[return-value]
+        except json.JSONDecodeError:
+            pass
 
     log.warning("llm_search: could not parse node IDs from LLM response: %r",
                 content[:200])
@@ -279,6 +377,81 @@ async def llm_json_chat(
         log.warning("llm_json_chat: LLM call failed: %s: %s",
                     type(e).__name__, e)
         return None
+
+
+async def _call_llm(prompt: str, max_tokens: int = 512) -> Optional[List[int]]:
+    """Send prompt to LLM with retry + backup fallback.
+
+    Retry strategy:
+      1. Primary LLM: up to _LLM_MAX_RETRIES attempts with exponential backoff
+         (2s → 4s → 8s by default). Transient errors (timeout, http_429/500)
+         retry; permanent errors (http_400/401/403) do not.
+      2. If primary fails after all retries → try backup LLM once
+         (skipped if backup uses same provider as primary).
+      3. Returns None only if both primary and backup fail.
+
+    The caller (llm_rank) falls back to chronological order on None.
+    """
+    primary_cfg = _llm_config()
+    if not primary_cfg["api_key"] or not primary_cfg["base_url"]:
+        log.debug("llm_search: no LLM credentials — skipping")
+        return None
+
+    # ── Primary LLM with retry ──
+    last_reason: str = "unknown"
+    for attempt in range(1, _LLM_MAX_RETRIES + 1):
+        result, reason = await _call_llm_once(prompt, primary_cfg, max_tokens)
+        last_reason = reason
+
+        if result is not None and len(result) > 0:
+            if attempt > 1:
+                log.info("llm_search: primary LLM succeeded on attempt %d/%d "
+                         "(prev errors: %s)",
+                         attempt, _LLM_MAX_RETRIES, last_reason)
+            return result
+
+        if attempt < _LLM_MAX_RETRIES:
+            # Don't retry permanent client errors (auth, bad request)
+            if reason.startswith("http_4") and reason not in ("http_429",):
+                log.warning("llm_search: primary LLM permanent error (%s) — "
+                            "not retrying", reason)
+                break
+
+            delay = _LLM_RETRY_BASE_DELAY_S * (2 ** (attempt - 1))
+            log.info("llm_search: primary LLM attempt %d/%d failed (%s) — "
+                     "retrying in %.1fs",
+                     attempt, _LLM_MAX_RETRIES, reason, delay)
+            await asyncio.sleep(delay)
+
+    log.warning("llm_search: primary LLM (%s) failed after %d attempts "
+                "(last: %s)",
+                primary_cfg["model"], _LLM_MAX_RETRIES, last_reason)
+
+    # ── Backup LLM ──
+    backup_cfg = _llm_backup_config()
+    if not (backup_cfg["api_key"] and backup_cfg["base_url"]):
+        log.warning("llm_search: no backup LLM configured")
+        return None
+
+    # Skip backup if same provider as primary (shared failure mode)
+    if _is_same_provider(primary_cfg, backup_cfg):
+        log.warning("llm_search: backup LLM uses same provider as primary "
+                    "(%s) — skipping redundant backup",
+                    backup_cfg["base_url"])
+        return None
+
+    log.info("llm_search: trying backup LLM %s @ %s ...",
+             backup_cfg["model"], backup_cfg["base_url"])
+    result, reason = await _call_llm_once(
+        prompt, backup_cfg, max_tokens, timeout=45.0,
+    )
+    if result is not None and len(result) > 0:
+        log.info("llm_search: backup LLM (%s) succeeded", backup_cfg["model"])
+        return result
+    log.warning("llm_search: backup LLM (%s) also failed (%s)",
+                backup_cfg["model"], reason)
+
+    return None
 
 
 # ── Search entry point ─────────────────────────────────────────────────────

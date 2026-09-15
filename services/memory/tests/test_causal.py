@@ -62,7 +62,8 @@ def _make_request(session_id="s1", plan_id="p1", msg="test event",
                 x=o[1] if len(o) > 1 else 0.0,
                 y=o[2] if len(o) > 2 else 0.0,
                 z=o[3] if len(o) > 3 else 0.0,
-            ) for o in objects]
+            ) for o in objects],
+            origin="world",
         )
     return RememberRequest(
         session_id=session_id, plan_id=plan_id,

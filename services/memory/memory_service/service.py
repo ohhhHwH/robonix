@@ -195,7 +195,7 @@ _tags = TagIndex()
 _vectors = VectorStore(alpha=0.3, embedding_enabled=_ENABLE_EMBEDDING)
 _images = ImageStore()
 _remember_pipe = RememberPipeline(_graph, _tags, _vectors, _images)
-_retrieve_pipe = RetrievePipeline(_graph, _tags, _vectors)
+_retrieve_pipe = RetrievePipeline(_graph, _tags, _vectors, data_dir=MEMORY_DIR)
 _compact_pipe = CompactPipeline(_graph)
 
 # ── 2c. Scene Hook HTTP server ───────────────────────────────────────
@@ -231,7 +231,7 @@ class MemoryService:
         # Always create own pipelines bound to own stores
         self._images = ImageStore()
         self._remember_pipe = RememberPipeline(self.graph, self.tags, self.vectors, self._images)
-        self._retrieve_pipe = RetrievePipeline(self.graph, self.tags, self.vectors)
+        self._retrieve_pipe = RetrievePipeline(self.graph, self.tags, self.vectors, data_dir=data_dir)
         self._compact_pipe = CompactPipeline(self.graph)
 
     @property
@@ -257,10 +257,12 @@ class MemoryService:
         return await self._remember_pipe.execute(req)
 
     async def search(self, query: str, tags=None, top_k: int = 5,
-                     alpha=None, time_range=None, require_executable: bool = False):
+                     alpha=None, time_range=None, require_executable: bool = False,
+                     vlm_qa: bool = False):
         req = SearchRequest(
             query=query, tags=tags, top_k=top_k, alpha=alpha,
             time_range=time_range, require_executable=require_executable,
+            vlm_qa=vlm_qa,
         )
         return await self._retrieve_pipe.execute(req)
 

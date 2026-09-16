@@ -59,15 +59,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 # Webots simulator (Cyberbotics .deb; apt "webots" is often unavailable on minimal images)
 # Match ros-humble-webots-ros2 (~2025.x) — see https://github.com/cyberbotics/webots/releases
-# Default URL uses ghfast.top mirror for reliable access; override with
-# --build-arg WEBOTS_DEB_URL=https://github.com/... for direct GitHub.
-ARG WEBOTS_DEB_URL=https://ghfast.top/https://github.com/cyberbotics/webots/releases/download/R2025a/webots_2025a_amd64.deb
+# A pre-downloaded copy in the build context (webots_2025a_amd64.deb) is COPY'd in
+# so the build does not depend on reaching GitHub through a proxy.
+COPY webots_2025a_amd64.deb /tmp/webots_2025a_amd64.deb
 RUN set -eux; \
-    wget -S --progress=dot:giga -O /tmp/webots.deb "${WEBOTS_DEB_URL}"; \
-    ls -lh /tmp/webots.deb; \
+    ls -lh /tmp/webots_2025a_amd64.deb; \
     apt-get update; \
-    apt-get install -y --no-install-recommends /tmp/webots.deb; \
-    rm -f /tmp/webots.deb; \
+    apt-get install -y --no-install-recommends /tmp/webots_2025a_amd64.deb; \
+    rm -f /tmp/webots_2025a_amd64.deb; \
     rm -rf /var/lib/apt/lists/*
 
 # Keep the remote viewer in read-only W3D broadcast mode. The public stream

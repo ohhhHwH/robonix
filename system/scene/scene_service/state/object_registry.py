@@ -13,7 +13,7 @@ import math
 import re
 import time
 from dataclasses import dataclass, field
-from typing import Iterable, Optional, Tuple
+from typing import Any, Iterable, Optional, Tuple
 
 
 # ── Attribute schema ────────────────────────────────────────────────────────
@@ -129,6 +129,16 @@ class SceneObject:
     # Latest 2D bounding-box in image pixels [x0, y0, x1, y1] from the
     # VLM detector.  None when unavailable (e.g. ConceptGraphs path).
     last_bbox_2d: Optional[tuple[float, float, float, float]] = None
+    # Detection-time frame + camera transform, stamped by the perception
+    # detector on FIRST insert so the ObjectWatchdog can annotate each
+    # object against the frame and camera pose it was actually seen from
+    # (not a later re-capture after the robot has moved). Both are None
+    # for records that predate this field or came from a source without
+    # an image (restored/planar/self). `detect_frame` is a BGR uint8
+    # HxWx3 numpy array; `detect_cam_to_map` is a 4x4 camera→map
+    # homogeneous transform.
+    detect_frame: Optional[Any] = None
+    detect_cam_to_map: Optional[Any] = None
 
 
 @dataclass

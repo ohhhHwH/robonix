@@ -1398,7 +1398,7 @@ class ConceptGraphsDetector:
         self._update_visible_absence(depth=depth, K=K, trans_pose=trans_pose)
         self._tick_idx += 1
         self._maybe_periodic_cleanup()
-        self._project_to_registry()
+        self._project_to_registry(rgb_bgr=rgb, cam_to_map=trans_pose)
 
     def _update_visible_absence(self, *, depth, K, trans_pose) -> None:
         """Remove map objects whose old location is verifiably empty.
@@ -2094,9 +2094,17 @@ class ConceptGraphsDetector:
         )
 
     # ── Project MapObjectList → ObjectRegistry ──────────────────────
-    def _project_to_registry(self) -> None:
+    def _project_to_registry(self, *, rgb_bgr=None, cam_to_map=None) -> None:
         """Replace registry's perception-source objects with a snapshot
         of the current MapObjectList. Robot self-record is preserved.
+
+        ``rgb_bgr`` / ``cam_to_map`` are the detection-time frame and
+        camera→map transform for the tick that produced these objects.
+        They are stamped onto *newly-inserted* records only, so the
+        ObjectWatchdog can annotate each object against the frame it was
+        actually first seen from instead of a later re-capture. None
+        (e.g. the periodic-cleanup path, which has no fresh frame) leaves
+        any existing stamp untouched and inserts no stamp.
 
         Runs from the worker thread; the registry uses an asyncio.Lock,
         so we schedule the actual mutation back onto the asyncio loop
@@ -2184,6 +2192,9 @@ class ConceptGraphsDetector:
                     "size_y": float(max(0.05, obb_extent[1])),
                     "size_z": float(max(0.05, obb_extent[2])),
                     "confidence": max(0.0, min(1.0, conf)),
+                    # Detection-time annotation source (see method doc).
+                    "detect_frame": rgb_bgr,
+                    "detect_cam_to_map": cam_to_map,
                 })
             except Exception:  # noqa: BLE001
                 continue
@@ -2339,6 +2350,12 @@ class ConceptGraphsDetector:
                         obj.attributes["cg_uuid"] = u
                         self._uuid_to_oid[u] = obj.object_id
                     adopted_oids.add(obj.object_id)
+                    # Stamp the detection-time frame + camera pose so the
+                    # ObjectWatchdog annotates this object against the view
+                    # it was first seen from (see _project_to_registry).
+                    if s.get("detect_frame") is not None:
+                        obj.detect_frame = s["detect_frame"]
+                        obj.detect_cam_to_map = s["detect_cam_to_map"]
 
             # Evict registry records whose source uuid is gone. Runs AFTER
             # bind/adopt so a record adopted above (cg_uuid rebound to a live

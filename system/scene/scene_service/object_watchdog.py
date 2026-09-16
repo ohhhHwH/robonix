@@ -372,19 +372,32 @@ class ObjectWatchdog:
                           for o in new_objects),
             )
 
-            # Step 1: capture ONE raw BGR frame for the whole batch.
+            # Save each object against the frame + camera pose it was
+            # first detected from. The perception detector stamps those
+            # on the record (`detect_frame` / `detect_cam_to_map`), so a
+            # batch flushed after the robot has moved still annotates
+            # each object as it was actually seen. Fall back to a fresh
+            # capture + live TF when the stamp is absent.
             loop = asyncio.get_running_loop()
-            bgr = await loop.run_in_executor(None, self._capture_raw_bgr)
-            if bgr is None:
-                log.warning("object_watchdog: raw frame capture failed — "
-                            "skipping %d new object(s)", len(new_objects))
-                return
-
-            # Step 2: for each object, project→annotate a copy→encode→POST.
-            h, w = bgr.shape[:2]
             saved = 0
             for obj in new_objects:
-                px, py = self._project_to_pixel(obj, w, h)
+                det_frame = getattr(obj, "detect_frame", None)
+                if det_frame is not None:
+                    bgr = det_frame
+                    h, w = bgr.shape[:2]
+                    px, py = self._project_with_detect_pose(obj, w, h)
+                    if px is None:
+                        px, py = self._project_to_pixel(obj, w, h)
+                else:
+                    bgr = await loop.run_in_executor(None, self._capture_raw_bgr)
+                    if bgr is None:
+                        log.warning(
+                            "object_watchdog: raw frame capture failed — "
+                            "skipping %s", obj.cls,
+                        )
+                        continue
+                    h, w = bgr.shape[:2]
+                    px, py = self._project_to_pixel(obj, w, h)
                 img_b64 = await loop.run_in_executor(
                     None, self._annotate_and_encode, bgr, obj, px, py,
                 )
@@ -393,7 +406,10 @@ class ObjectWatchdog:
                                 obj.cls)
                     continue
                 self._mark_seen(obj)
-                ok = await self._save_object(obj, img_b64, w, h)
+                ok = await self._save_object(
+                    obj, img_b64, w, h,
+                    detect_cam_to_map=getattr(obj, "detect_cam_to_map", None),
+                )
                 if ok:
                     key = self._grid_key(obj)
                     self._grid_img_count[key] = 1
@@ -498,53 +514,140 @@ class ObjectWatchdog:
             return ""
 
     def _project_to_pixel(self, obj, img_w: int, img_h: int):
-        """Return the object's pixel position for annotation / masking.
+        """Return the object's pixel position for annotation.
 
-        When ``obj.last_bbox_2d`` is populated (VLM detector path), the
-        bbox centre is used directly — this is the actual detector output
-        and needs no projection.  Otherwise falls back to approximate
-        3D→2D pinhole projection.
+        The marker must land on the object the MemoryNode describes, and
+        the node's identity is the object's *world* pose. So the primary
+        method re-projects ``obj.pose`` (world) into the current camera
+        frame through the full 6-DoF camera↔map transform plus intrinsics
+        — this stays correct after the robot has moved.
+
+        The VLM ``last_bbox_2d`` is only a fallback when camera geometry
+        is unavailable. It is otherwise *stale*: the bbox is cached from
+        an earlier detection frame, so reusing it against a later captured
+        frame lands the marker on the wrong object (the reported
+        image↔node mismatch).
         """
-        # ── Path A: real pixel bbox from VLM detector ───────────────
+        px, py = self._project_world_to_pixel(obj, img_w, img_h)
+        if px is not None:
+            return px, py
+
+        # Fallback: last known 2D bbox from the VLM detector. Only used
+        # when the camera transform / intrinsics are missing.
         bb = getattr(obj, 'last_bbox_2d', None)
         if bb is not None and len(bb) == 4:
             cx = int((bb[0] + bb[2]) / 2)
             cy = int((bb[1] + bb[3]) / 2)
             return max(0, min(img_w - 1, cx)), max(0, min(img_h - 1, cy))
 
-        # ── Path B: approximate 3D→2D projection (fallback) ─────────
-        cam_x = cam_y = cam_z = 0.0
-        cam_yaw = 0.0
-        if self._hub is not None:
-            cam_frame = os.environ.get(
-                "SCENE_CAMERA_FRAME", "head_front_camera_rgb_optical_frame"
-            )
-            pose = self._hub.lookup_xy_yaw(cam_frame, "map")
-            if pose is not None:
-                cam_x, cam_y, cam_z, cam_yaw = pose
+        log.warning(
+            "object_watchdog: no camera geometry for %s — annotating at "
+            "image centre (marker position is unreliable)",
+            getattr(obj, "object_id", "?"),
+        )
+        return img_w // 2, img_h // 2
 
-        obj_x, obj_y, obj_z = float(obj.pose.x), float(obj.pose.y), float(obj.pose.z)
-        dwx, dwy, dwz = obj_x - cam_x, obj_y - cam_y, obj_z - cam_z
+    def _project_world_to_pixel(self, obj, img_w: int, img_h: int):
+        """Project ``obj.pose`` (world) into camera pixels.
 
-        cos_y, sin_y = np.cos(cam_yaw), np.sin(cam_yaw)
-        bx = dwx * cos_y + dwy * sin_y
-        by = -dwx * sin_y + dwy * cos_y
-        ox, oy, oz = -by, -dwz, bx  # body → ROS optical
+        Returns ``(px, py)`` clamped to the image, or ``(None, None)`` when
+        the camera transform / intrinsics are unavailable or the point is
+        behind the camera. Uses the full 6-DoF camera transform (not a
+        yaw-only approximation) so a tilted head camera projects correctly.
+        """
+        if self._hub is None:
+            return None, None
+        lookup = getattr(self._hub, "lookup_transform_4x4", None)
+        if lookup is None:
+            return None, None
+
+        world_frame = str(obj.pose.frame_id or "").strip().lstrip("/")
+        cam_frame = os.environ.get(
+            "SCENE_CAMERA_FRAME", "head_front_camera_rgb_optical_frame"
+        ).strip().lstrip("/")
+        if not world_frame or not cam_frame:
+            return None, None
+
+        try:
+            # world → optical camera (maps world-frame points into the
+            # camera frame; matches the transform convention used by
+            # perception's _build_camera_to_map_transform inverse).
+            T = lookup(world_frame, cam_frame)
+        except Exception:  # noqa: BLE001
+            return None, None
+        if T is None:
+            return None, None
+        try:
+            T = np.asarray(T, dtype=np.float64)
+        except Exception:  # noqa: BLE001
+            return None, None
+        if T.shape != (4, 4) or not np.all(np.isfinite(T)):
+            return None, None
 
         fx = fy = 554.0
-        cx, cy = img_w / 2, img_h / 2
+        cx, cy = img_w / 2.0, img_h / 2.0
+        if self._hub.has("intrinsics"):
+            intr_msg, _, _ = self._hub.latest("intrinsics")
+            if intr_msg is not None:
+                k = getattr(intr_msg, 'k', ())
+                if len(k) >= 6:
+                    fx, fy, cx, cy = float(k[0]), float(k[4]), float(k[2]), float(k[5])
+
+        ox, oy, oz = float(obj.pose.x), float(obj.pose.y), float(obj.pose.z)
+        cam = T @ np.array([ox, oy, oz, 1.0], dtype=np.float64)
+        X, Y, Z = float(cam[0]), float(cam[1]), float(cam[2])
+        # Behind / coincident with the camera — cannot project.
+        if Z <= 1e-3:
+            return None, None
+        u = fx * X / Z + cx
+        v = fy * Y / Z + cy
+        return (
+            int(round(max(0.0, min(float(img_w - 1), u)))),
+            int(round(max(0.0, min(float(img_h - 1), v)))),
+        )
+
+    def _project_with_detect_pose(self, obj, img_w: int, img_h: int):
+        """Project ``obj``'s world pose through the camera transform
+        captured at detection time (stamped on the record by the
+        perception detector), so the marker lands where the object
+        actually was when it was first seen — even after the robot has
+        moved.
+
+        Returns ``(px, py)`` clamped to the image, or ``(None, None)``
+        when the stored transform is missing / unusable or the point is
+        behind the camera, so the caller can fall back to the live TF.
+        """
+        T_cam_map = getattr(obj, "detect_cam_to_map", None)
+        if T_cam_map is None:
+            return None, None
+        try:
+            T_cam_map = np.asarray(T_cam_map, dtype=np.float64)
+            if T_cam_map.shape != (4, 4) or not np.all(np.isfinite(T_cam_map)):
+                return None, None
+            T_map_cam = np.linalg.inv(T_cam_map)
+        except Exception:
+            return None, None
+
+        fx = fy = 554.0
+        cx, cy = img_w / 2.0, img_h / 2.0
         if self._hub is not None and self._hub.has("intrinsics"):
             intr_msg, _, _ = self._hub.latest("intrinsics")
             if intr_msg is not None:
                 k = getattr(intr_msg, 'k', ())
-                if len(k) >= 4:
+                if len(k) >= 6:
                     fx, fy, cx, cy = float(k[0]), float(k[4]), float(k[2]), float(k[5])
 
-        if abs(oz) < 0.01:
-            oz = 1.0
-        u = int(fx * ox / oz + cx)
-        v = int(fy * oy / oz + cy)
-        return max(0, min(img_w - 1, u)), max(0, min(img_h - 1, v))
+        ox, oy, oz = float(obj.pose.x), float(obj.pose.y), float(obj.pose.z)
+        cam = T_map_cam @ np.array([ox, oy, oz, 1.0], dtype=np.float64)
+        X, Y, Z = float(cam[0]), float(cam[1]), float(cam[2])
+        if Z <= 1e-3:
+            return None, None
+        u = fx * X / Z + cx
+        v = fy * Y / Z + cy
+        return (
+            int(round(max(0.0, min(float(img_w - 1), u)))),
+            int(round(max(0.0, min(float(img_h - 1), v)))),
+        )
 
     def _build_camera_params(self, img_w: int, img_h: int) -> Dict[str, Any]:
         """Assemble camera_params for a remember payload (dataset spec).
@@ -586,6 +689,75 @@ class ObjectWatchdog:
             "camera_pose": camera_pose,
         }
 
+    @staticmethod
+    def _quat_from_rotmat(R) -> tuple:
+        """Rotation matrix (3x3) → (qx, qy, qz, qw)."""
+        R = np.asarray(R, dtype=np.float64)
+        m00, m01, m02 = R[0, 0], R[0, 1], R[0, 2]
+        m10, m11, m12 = R[1, 0], R[1, 1], R[1, 2]
+        m20, m21, m22 = R[2, 0], R[2, 1], R[2, 2]
+        tr = m00 + m11 + m22
+        if tr > 0.0:
+            s = math.sqrt(tr + 1.0) * 2.0
+            qw = 0.25 * s
+            qx = (m21 - m12) / s
+            qy = (m02 - m20) / s
+            qz = (m10 - m01) / s
+        elif m00 > m11 and m00 > m22:
+            s = math.sqrt(1.0 + m00 - m11 - m22) * 2.0
+            qw = (m21 - m12) / s
+            qx = 0.25 * s
+            qy = (m01 + m10) / s
+            qz = (m02 + m20) / s
+        elif m11 > m22:
+            s = math.sqrt(1.0 + m11 - m00 - m22) * 2.0
+            qw = (m02 - m20) / s
+            qx = (m01 + m10) / s
+            qy = 0.25 * s
+            qz = (m12 + m21) / s
+        else:
+            s = math.sqrt(1.0 + m22 - m00 - m11) * 2.0
+            qw = (m10 - m01) / s
+            qx = (m02 + m20) / s
+            qy = (m12 + m21) / s
+            qz = 0.25 * s
+        return float(qx), float(qy), float(qz), float(qw)
+
+    def _camera_params_from_transform(self, img_w: int, img_h: int,
+                                      T_cam_map) -> Dict[str, Any]:
+        """Build ``camera_params`` from a detection-time camera→map 4x4
+        transform (full 6-DoF pose + intrinsics), mirroring
+        ``_build_camera_params`` but carrying the actual pose the frame
+        was captured from instead of the live yaw-only estimate."""
+        fx = fy = 554.0
+        cx, cy = img_w / 2.0, img_h / 2.0
+        if self._hub is not None and self._hub.has("intrinsics"):
+            intr_msg, _, _ = self._hub.latest("intrinsics")
+            if intr_msg is not None:
+                k = getattr(intr_msg, 'k', ())
+                if len(k) >= 4:
+                    fx, fy, cx, cy = float(k[0]), float(k[4]), float(k[2]), float(k[5])
+
+        camera_pose: Optional[Dict[str, float]] = None
+        try:
+            T = np.asarray(T_cam_map, dtype=np.float64)
+            if T.shape == (4, 4) and np.all(np.isfinite(T)):
+                qx, qy, qz, qw = self._quat_from_rotmat(T[:3, :3])
+                camera_pose = {
+                    "x": float(T[0, 3]), "y": float(T[1, 3]), "z": float(T[2, 3]),
+                    "qx": qx, "qy": qy, "qz": qz, "qw": qw,
+                }
+        except Exception:
+            camera_pose = None
+
+        return {
+            "fx": fx, "fy": fy, "cx": cx, "cy": cy,
+            "width": int(img_w), "height": int(img_h),
+            "depth_scale": 0.001,
+            "camera_type": "rgb",
+            "camera_pose": camera_pose,
+        }
+
     # ── Room/region lookup ─────────────────────────────────────────────
 
     def _lookup_region(self, x: float, y: float) -> str:
@@ -602,8 +774,14 @@ class ObjectWatchdog:
     # ── POST to memgraph ───────────────────────────────────────────────
 
     async def _save_object(self, obj, img_b64: str,
-                           img_w: int = 0, img_h: int = 0) -> bool:
-        """POST a single-object remember request to the memgraph Scene Hook."""
+                           img_w: int = 0, img_h: int = 0,
+                           detect_cam_to_map=None) -> bool:
+        """POST a single-object remember request to the memgraph Scene Hook.
+
+        ``detect_cam_to_map``, when given, is the detection-time camera→map
+        transform stamped on the record; it is used to fill ``camera_params``
+        with the pose the annotated frame was actually captured from.
+        """
         import httpx
 
         frame_id = str(obj.pose.frame_id or "").strip()
@@ -618,7 +796,15 @@ class ObjectWatchdog:
         region = self._lookup_region(ox, oy)
         if region:
             log.info("object_watchdog: %s@%.1f,%.1f → region=%s", obj.cls, ox, oy, region)
-        camera_params = self._build_camera_params(img_w, img_h) if img_w and img_h else None
+        if img_w and img_h:
+            if detect_cam_to_map is not None:
+                camera_params = self._camera_params_from_transform(
+                    img_w, img_h, detect_cam_to_map,
+                )
+            else:
+                camera_params = self._build_camera_params(img_w, img_h)
+        else:
+            camera_params = None
         payload: Dict[str, Any] = {
             "session_id": "scene-watchdog",
             "plan_id": "scene-watchdog",

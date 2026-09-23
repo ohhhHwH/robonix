@@ -41,6 +41,7 @@ from .annotations import AnnotationStore
 from .ingest.capabilities import plan_perception, provider_for_kind
 from .map_binding import MapBinding, choose_map_binding, read_latched_lifecycle
 from .object_watchdog import ObjectWatchdog
+from .pose_grid_recorder import PoseGridRecorder
 from .map_meta import MapMetaStore
 from .robot_geometry import RobotGeometryState, reconcile_robot_geometry
 from .ingest.perception_concept_graphs import ConceptGraphsDetector
@@ -1659,6 +1660,20 @@ async def _run_active(config: dict) -> None:
         else (log.info(
             "object_watchdog: disabled (SCENE_OBJECT_WATCHDOG=%s)",
             os.environ.get("SCENE_OBJECT_WATCHDOG", "1"),
+        ) or [])),
+        # Pose-grid recorder: captures an image whenever the robot crosses a
+        # grid cell (POSE_GRID_SIZE_M) or rotates past a heading bucket
+        # (POSE_GRID_ANGLE_DEG), keyed by grid cell → one memory node per cell.
+        *((log.info(
+            "pose_grid: enabled (SCENE_POSE_GRID=%s)",
+            os.environ.get("SCENE_POSE_GRID", "1"),
+        ) or [asyncio.create_task(
+            PoseGridRecorder(hub=hub).run(),
+            name="pose-grid-recorder",
+        )]) if os.environ.get("SCENE_POSE_GRID", "1") in ("1", "true", "yes")
+        else (log.info(
+            "pose_grid: disabled (SCENE_POSE_GRID=%s)",
+            os.environ.get("SCENE_POSE_GRID", "1"),
         ) or [])),
         # P2 guard: warn when mapping's live map identity drifts from the
         # binding scene started with (P3 will act on it instead).

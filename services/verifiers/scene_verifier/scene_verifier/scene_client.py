@@ -59,9 +59,17 @@ async def fetch_robot_context(
     Imports remain local so pure tests do not require generated modules.
     The timeout covers MCP observation, but not synchronous Atlas calls.
     """
+    import httpx
     from robonix_api import ATLAS, Transport
     from mcp import ClientSession
     from mcp.client.streamable_http import streamablehttp_client
+
+    def _local_mcp_client(**kwargs):
+        # The MCP endpoint Atlas hands us is always local (127.0.0.1).
+        # Disable ambient proxy routing so a host shell that exports
+        # `all_proxy=socks://…` (which httpx rejects) cannot break the
+        # verification handshake. Mirrors the grpc proxy-bypass precedent.
+        return httpx.AsyncClient(trust_env=False, **kwargs)
 
     with ATLAS.connect_capability(
         consumer_id=consumer_id,
@@ -70,10 +78,20 @@ async def fetch_robot_context(
         transport=Transport.MCP,
     ) as channel:
 
+        # Scene declares its MCP endpoint with a trailing slash
+        # (e.g. http://127.0.0.1:56279/mcp/), but its streamable-HTTP app
+        # mounts at the slash-less path and answers the slashed URL with a
+        # 307 redirect.  httpx does not follow redirects by default, so the
+        # MCP client's raise_for_status() turns that redirect into a hard
+        # error.  Normalise the endpoint once so the POST lands on the real
+        # path and never triggers the redirect.
+        endpoint = channel.endpoint.rstrip("/")
+
         async def observe():
             """Return the MCP response after closing its session."""
             async with streamablehttp_client(
-                channel.endpoint
+                endpoint,
+                httpx_client_factory=_local_mcp_client,
             ) as (read, write, _):
                 async with ClientSession(read, write) as session:
                     await session.initialize()

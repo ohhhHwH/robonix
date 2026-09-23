@@ -630,7 +630,10 @@ if _MCP_AVAILABLE:
             "3. [nav] return"
           ],
           "plan_count":    1,                              // optional — number of RTDL trees
-          "canceled_count": 0                              // optional — canceled tree count
+          "canceled_count": 0,                             // optional — canceled tree count
+          "rtdl_plan":     "{...}",                        // optional — full Plan AST JSON sent to Executor
+          "raw_rtdl":      "{...}",                        // optional — raw LLM RTDL JSON before expansion
+          "plan_id":       "1"                             // optional — per-round id; the child key in the query→sub-plans tree
         }
 
         Response JSON: {"ok": true, "message": "Plan saved: \"去厨房拿可乐\" (3 steps)"}
@@ -655,6 +658,9 @@ if _MCP_AVAILABLE:
             steps=steps,
             plan_count=int(req_dict.get("plan_count", 1)),
             canceled_count=int(req_dict.get("canceled_count", 0)),
+            rtdl_plan=req_dict.get("rtdl_plan"),
+            raw_rtdl=req_dict.get("raw_rtdl"),
+            plan_id=req_dict.get("plan_id"),
         )
         log.info("API ptdl_remember: \"%s\" (%d steps)", query, len(steps))
         return _json_ok({"ok": True, "message": f"Plan saved: \"{query}\" ({len(steps)} steps)"})

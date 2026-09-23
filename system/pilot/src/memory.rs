@@ -120,18 +120,30 @@ pub async fn prefetch(
                     .get("description")
                     .and_then(|v| v.as_str())
                     .unwrap_or("");
-                let steps: Vec<&str> = p
-                    .get("steps")
-                    .and_then(|v| v.as_array())
-                    .map(|a| a.iter().filter_map(|s| s.as_str()).collect())
-                    .unwrap_or_default();
                 out.push_str(&format!("**Plan {}:** {}\n", i + 1, q));
                 if !d.is_empty() {
                     out.push_str(&format!("  description: {}\n", d));
                 }
-                if !steps.is_empty() {
-                    out.push_str("  steps:\n");
-                    for s in steps {
+                // Tree shape: one root record → several sub-plans, each
+                // carrying its own steps. Fall back to a flat `steps` array
+                // for legacy records.
+                if let Some(subs) = p.get("plans").and_then(|v| v.as_array()) {
+                    for sub in subs {
+                        let sd = sub
+                            .get("description")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("");
+                        if !sd.is_empty() {
+                            out.push_str(&format!("  - {}\n", sd));
+                        }
+                        if let Some(steps) = sub.get("steps").and_then(|v| v.as_array()) {
+                            for s in steps.iter().filter_map(|s| s.as_str()) {
+                                out.push_str(&format!("      {}\n", s));
+                            }
+                        }
+                    }
+                } else if let Some(steps) = p.get("steps").and_then(|v| v.as_array()) {
+                    for s in steps.iter().filter_map(|s| s.as_str()) {
                         out.push_str(&format!("    {}\n", s));
                     }
                 }
@@ -161,8 +173,11 @@ pub fn save_plan(
     user_query: String,
     plan_description: String,
     steps: Vec<TreeStep>,
+    rtdl_plan: Option<String>,
+    raw_rtdl: Option<String>,
     tree_count: usize,
     canceled_count: usize,
+    plan_id: Option<String>,
 ) {
     tokio::spawn(async move {
         let _ = std::fs::OpenOptions::new()
@@ -190,6 +205,9 @@ pub fn save_plan(
             "steps": &steps_text,
             "plan_count": tree_count,
             "canceled_count": canceled_count,
+            "rtdl_plan": rtdl_plan,
+            "raw_rtdl": raw_rtdl,
+            "plan_id": plan_id,
         });
         let payload_str = serde_json::to_string(&payload).unwrap_or_default();
         let args_json = serde_json::json!({ "data": payload_str }).to_string();

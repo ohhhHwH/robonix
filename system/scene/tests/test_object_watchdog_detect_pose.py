@@ -57,16 +57,35 @@ def test_project_offsets_match_pinhole(watchdog):
     # to stay well inside the image so no clamping is involved.
     obj = _make_obj(1.0, 0.4, 2.0, T)
     px, py = watchdog._project_with_detect_pose(obj, 640, 480)
-    assert px == 320 + int(round(554.0 * 1.0 / 2.0))   # 597
-    assert py == 240 + int(round(554.0 * 0.4 / 2.0))   # 351
+    assert px == 320 + 554.0 * 1.0 / 2.0   # 597.0
+    assert py == 240 + 554.0 * 0.4 / 2.0   # 350.8
 
 
-def test_project_clamps_to_image(watchdog):
-    """Off-axis points clamp to the image border instead of overflowing."""
+def test_project_returns_unclamped(watchdog):
+    """Off-axis points return their unclamped projection; the caller
+    (via ``_center_in_frame``) decides whether to skip them."""
     T = np.eye(4)
     obj = _make_obj(100.0, 0.0, 2.0, T)
     px, py = watchdog._project_with_detect_pose(obj, 640, 480)
-    assert (px, py) == (639, 240)
+    # u = 320 + 554 * (100 / 2) = 28020 (far off-frame), v = 240.
+    assert px == 320 + 554.0 * 100.0 / 2.0
+    assert py == 240.0
+
+
+def test_center_in_frame_rejects_offscreen(watchdog):
+    """A centre projecting outside the frame is rejected; interior is kept."""
+    assert watchdog._center_in_frame(320.0, 240.0, 640, 480) is True
+    assert watchdog._center_in_frame(-1.0, 240.0, 640, 480) is False
+    assert watchdog._center_in_frame(640.0, 240.0, 640, 480) is False
+    assert watchdog._center_in_frame(320.0, -0.5, 640, 480) is False
+    assert watchdog._center_in_frame(320.0, 480.0, 640, 480) is False
+
+
+def test_clamp_to_pixel(watchdog):
+    """Clamp maps an unclamped projection back into integer pixels."""
+    assert watchdog._clamp_to_pixel(28020.0, 240.0, 640, 480) == (639, 240)
+    assert watchdog._clamp_to_pixel(320.0, 240.0, 640, 480) == (320, 240)
+    assert watchdog._clamp_to_pixel(-50.0, -50.0, 640, 480) == (0, 0)
 
 
 def test_project_behind_camera_returns_none(watchdog):

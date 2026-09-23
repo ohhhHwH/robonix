@@ -35,6 +35,8 @@ Env vars:
   ``OBJECT_WATCHDOG_INTERVAL_STATIC_LONG_S`` — long-static interval (default 120.0).
   ``OBJECT_WATCHDOG_STATIC_LONG_THRESHOLD_S`` — long-static threshold (default 300.0).
   ``OBJECT_WATCHDOG_INTERVAL_S`` — fallback / legacy interval (default 2.0).
+  ``OBJECT_WATCHDOG_CENTER_MARGIN_PX`` — border band (px) within which a
+  projected object centre counts as "at the edge" and is skipped (default 0.0).
 """
 
 from __future__ import annotations
@@ -64,6 +66,12 @@ _MEMGRAPH_HOOK_URL = os.environ.get(
     "http://127.0.0.1:37798",
 )
 _DEFAULT_INTERVAL_S = 2.0
+
+# Pixels of the image border within which a projected object centre is
+# treated as "at the edge" and its image memory is skipped.  A centre
+# that projects outside the frame is always skipped regardless of this.
+_CENTER_EDGE_MARGIN_PX = float(os.environ.get(
+    "OBJECT_WATCHDOG_CENTER_MARGIN_PX", "0.0"))
 
 # ── Dynamic interval env vars ──────────────────────────────────────────
 
@@ -398,8 +406,19 @@ class ObjectWatchdog:
                         continue
                     h, w = bgr.shape[:2]
                     px, py = self._project_to_pixel(obj, w, h)
+                # Skip objects whose centre projects onto / past the image
+                # edge — a border-clamped marker records a useless frame
+                # (the object is out of view).
+                if not self._center_in_frame(px, py, w, h):
+                    log.info(
+                        "object_watchdog: skip %s — centre (%.0f, %.0f) "
+                        "off-frame %dx%d", obj.cls, px, py, w, h,
+                    )
+                    continue
+                dpx, dpy = self._clamp_to_pixel(px, py, w, h)
+
                 img_b64 = await loop.run_in_executor(
-                    None, self._annotate_and_encode, bgr, obj, px, py,
+                    None, self._annotate_and_encode, bgr, obj, dpx, dpy,
                 )
                 if not img_b64:
                     log.warning("object_watchdog: annotate failed for %s — retry",
@@ -435,9 +454,20 @@ class ObjectWatchdog:
                     node_id = self._grid_node.get(key)
                     if node_id is None or node_id == 0:
                         continue
-                    px, py = self._project_to_pixel(obj, w, h)
+                    # Use the detection-time camera pose (stamped on the
+                    # record) instead of a live TF lookup, which is often
+                    # unavailable here and used to fall through to the
+                    # image-centre fallback. Skip the object entirely when
+                    # the stored pose is missing / unusable or the object is
+                    # behind the camera — never default to image centre.
+                    px, py = self._project_with_detect_pose(obj, w, h)
+                    if px is None:
+                        continue
+                    if not self._center_in_frame(px, py, w, h):
+                        continue
+                    dpx, dpy = self._clamp_to_pixel(px, py, w, h)
                     img_b64 = await loop.run_in_executor(
-                        None, self._annotate_and_encode, bgr, obj, px, py,
+                        None, self._annotate_and_encode, bgr, obj, dpx, dpy,
                     )
                     if img_b64:
                         ok = await self._append_image(node_id, obj, img_b64)
@@ -514,13 +544,16 @@ class ObjectWatchdog:
             return ""
 
     def _project_to_pixel(self, obj, img_w: int, img_h: int):
-        """Return the object's pixel position for annotation.
+        """Return the object's projected centre as *unclamped* ``(u, v)``.
 
         The marker must land on the object the MemoryNode describes, and
         the node's identity is the object's *world* pose. So the primary
         method re-projects ``obj.pose`` (world) into the current camera
         frame through the full 6-DoF camera↔map transform plus intrinsics
         — this stays correct after the robot has moved.
+
+        Coordinates are returned unclamped so the caller can reject an
+        off-frame centre before saving; clamp with ``_clamp_to_pixel``.
 
         The VLM ``last_bbox_2d`` is only a fallback when camera geometry
         is unavailable. It is otherwise *stale*: the bbox is cached from
@@ -536,24 +569,42 @@ class ObjectWatchdog:
         # when the camera transform / intrinsics are missing.
         bb = getattr(obj, 'last_bbox_2d', None)
         if bb is not None and len(bb) == 4:
-            cx = int((bb[0] + bb[2]) / 2)
-            cy = int((bb[1] + bb[3]) / 2)
-            return max(0, min(img_w - 1, cx)), max(0, min(img_h - 1, cy))
+            return float((bb[0] + bb[2]) / 2), float((bb[1] + bb[3]) / 2)
 
         log.warning(
             "object_watchdog: no camera geometry for %s — annotating at "
             "image centre (marker position is unreliable)",
             getattr(obj, "object_id", "?"),
         )
-        return img_w // 2, img_h // 2
+        return float(img_w) / 2.0, float(img_h) / 2.0
+
+    def _center_in_frame(self, u: float, v: float, img_w: int, img_h: int) -> bool:
+        """Return True when the object's projected centre lies inside the
+        frame, outside the ``_CENTER_EDGE_MARGIN_PX`` border band.
+
+        A centre that projects off-frame (or onto the border) yields a
+        worthless image memory — the object is (mostly) out of view — so
+        callers skip it before annotating / saving.
+        """
+        m = _CENTER_EDGE_MARGIN_PX
+        return (m <= u <= (img_w - 1) - m) and (m <= v <= (img_h - 1) - m)
+
+    @staticmethod
+    def _clamp_to_pixel(u: float, v: float, img_w: int, img_h: int) -> tuple:
+        """Clamp an unclamped float projection to integer pixel coords."""
+        return (
+            int(round(max(0.0, min(float(img_w - 1), u)))),
+            int(round(max(0.0, min(float(img_h - 1), v)))),
+        )
 
     def _project_world_to_pixel(self, obj, img_w: int, img_h: int):
         """Project ``obj.pose`` (world) into camera pixels.
 
-        Returns ``(px, py)`` clamped to the image, or ``(None, None)`` when
+        Returns the *unclamped* ``(u, v)`` centre, or ``(None, None)`` when
         the camera transform / intrinsics are unavailable or the point is
         behind the camera. Uses the full 6-DoF camera transform (not a
         yaw-only approximation) so a tilted head camera projects correctly.
+        Callers clamp with ``_clamp_to_pixel`` after checking in-frame.
         """
         if self._hub is None:
             return None, None
@@ -601,10 +652,7 @@ class ObjectWatchdog:
             return None, None
         u = fx * X / Z + cx
         v = fy * Y / Z + cy
-        return (
-            int(round(max(0.0, min(float(img_w - 1), u)))),
-            int(round(max(0.0, min(float(img_h - 1), v)))),
-        )
+        return u, v
 
     def _project_with_detect_pose(self, obj, img_w: int, img_h: int):
         """Project ``obj``'s world pose through the camera transform
@@ -613,9 +661,10 @@ class ObjectWatchdog:
         actually was when it was first seen — even after the robot has
         moved.
 
-        Returns ``(px, py)`` clamped to the image, or ``(None, None)``
+        Returns the *unclamped* ``(u, v)`` centre, or ``(None, None)``
         when the stored transform is missing / unusable or the point is
         behind the camera, so the caller can fall back to the live TF.
+        Callers clamp with ``_clamp_to_pixel`` after checking in-frame.
         """
         T_cam_map = getattr(obj, "detect_cam_to_map", None)
         if T_cam_map is None:
@@ -644,10 +693,7 @@ class ObjectWatchdog:
             return None, None
         u = fx * X / Z + cx
         v = fy * Y / Z + cy
-        return (
-            int(round(max(0.0, min(float(img_w - 1), u)))),
-            int(round(max(0.0, min(float(img_h - 1), v)))),
-        )
+        return u, v
 
     def _build_camera_params(self, img_w: int, img_h: int) -> Dict[str, Any]:
         """Assemble camera_params for a remember payload (dataset spec).

@@ -266,6 +266,14 @@ struct TreeMeta {
     /// visible lets the model target any semantic boundary in one control call
     /// instead of querying live state first or guessing what "current" means.
     steps: Vec<TreeStep>,
+    /// Serialized full RTDL Plan AST, exactly as handed to Executor. Prost's
+    /// `Plan`/`RtdlNode` do not derive `serde`, so this is produced by
+    /// `plan_to_json`. Absent for recovery / meta-op trees (which never reach
+    /// Executor).
+    plan_json: Option<String>,
+    /// Serialized raw LLM RTDL JSON (the model's structured plan output before
+    /// expansion). Absent on recovery paths where the model produced nothing.
+    raw_rtdl: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -606,6 +614,53 @@ fn plan_steps(plan: &Plan) -> Vec<TreeStep> {
             })
         })
         .collect()
+}
+
+/// Serialize the full RTDL Plan AST (as handed to Executor) to a JSON string.
+///
+/// Prost-generated `Plan`/`RtdlNode` do not derive `serde`, so the tree is
+/// reconstructed by hand. Unlike `plan_steps` (which keeps only the flattened
+/// executable leaves), this preserves the operator tree — node kind, child
+/// indices, op_id, description, and every capability call with its args — so a
+/// saved plan can later be re-inspected (and, in principle, re-executed).
+fn plan_to_json(plan: &Plan) -> String {
+    let nodes: Vec<serde_json::Value> = plan
+        .nodes
+        .iter()
+        .map(|node| {
+            let kind = match node.node_kind {
+                RTDL_SEQUENCE => "sequence",
+                RTDL_PARALLEL => "parallel",
+                RTDL_DO => "do",
+                _ => "unknown",
+            };
+            let call = node.call.as_ref().map(|c| {
+                let args = serde_json::from_str::<serde_json::Value>(&c.args_json)
+                    .unwrap_or_else(|_| serde_json::Value::String(c.args_json.clone()));
+                serde_json::json!({
+                    "call_id": c.call_id,
+                    "provider_id": c.provider_id,
+                    "contract_id": c.contract_id,
+                    "args": args,
+                })
+            });
+            serde_json::json!({
+                "node_kind": kind,
+                "op_id": node.op_id,
+                "description": node.description,
+                "children": node.children,
+                "call": call,
+            })
+        })
+        .collect();
+    serde_json::json!({
+        "plan_id": plan.plan_id,
+        "session_id": plan.session_id,
+        "round": plan.round,
+        "root_index": plan.root_index,
+        "nodes": nodes,
+    })
+    .to_string()
 }
 
 fn build_forest_block(
@@ -987,9 +1042,12 @@ fn flush_accumulated_plan(
             target.clone(),
             user_goal.to_string(),
             plan_desc,
-            steps,
+            Vec::new(), // steps live on each child sub-plan, not the root
+            None,       // rtdl_plan — merged rollup has no single tree AST
+            None,       // raw_rtdl — per-round entries carry the raw model output
             n_trees,
-            0, // canceled_count
+            0,     // canceled_count
+            None,  // plan_id — rollup finalizes the root, adds no child
         );
     }
 }
@@ -1441,8 +1499,11 @@ pub async fn run_turn(
                                             user_goal.clone(),
                                             desc,
                                             tree_meta.steps.clone(),
+                                            tree_meta.plan_json.clone(),
+                                            tree_meta.raw_rtdl.clone(),
                                             1, // single tree
                                             0, // not canceled
+                                            Some(plan_id.clone()),
                                         );
                                     }
                                 }
@@ -1490,8 +1551,11 @@ pub async fn run_turn(
                                             user_goal.clone(),
                                             desc,
                                             tree_meta.steps.clone(),
+                                            tree_meta.plan_json.clone(),
+                                            tree_meta.raw_rtdl.clone(),
                                             1, // single tree
                                             if canceled { 1 } else { 0 },
+                                            Some(plan_id.clone()),
                                         );
                                     }
                                 }
@@ -1610,6 +1674,10 @@ pub async fn run_turn(
         // recovery plan) instead of crashing the whole turn. The loop yields a
         // valid (narration, tree label, plan, id) tuple for the forest dispatch.
         let mut correction: Option<String> = None;
+        // Serialized raw LLM RTDL from the (final, successful) planning round,
+        // captured inside the loop and carried out so it can be persisted with
+        // the dispatched tree.
+        let mut raw_rtdl: Option<String> = None;
         let (assistant_content, rtdl_description, graph, meta_op, plan_id, task_update, recovered) = loop {
             let sections = [
                 PromptSection {
@@ -1893,6 +1961,10 @@ pub async fn run_turn(
                 // expands — never on a recovery path, where it could falsely
                 // mark the turn done for a plan that never ran.
                 Ok(graph) => {
+                    raw_rtdl = Some(
+                        serde_json::to_string(&rtdl)
+                            .unwrap_or_else(|_| String::new()),
+                    );
                     break (
                         assistant_content,
                         rtdl_description,
@@ -2193,6 +2265,8 @@ pub async fn run_turn(
                 control_only: is_control_only(&graph),
                 call_signatures,
                 steps: plan_steps(&graph),
+                plan_json: Some(plan_to_json(&graph)),
+                raw_rtdl: raw_rtdl.clone(),
             },
         );
         tokio::spawn(drive_plan(
@@ -3292,7 +3366,8 @@ mod tests {
         extract_json_object, feed_results_into_history, format_plan_summary, invalid_cancel_target,
         is_control_only, is_legacy_plan_control_contract, mixes_control_inspection_with_action,
         parse_meta_plan_op, parse_rtdl_assistant_response, parse_task_update, plan_call_signatures,
-        record_dispatched_plan, rtdl_node_kind_name, rtdl_recovery_final_text, rtdl_state_name,
+        plan_to_json, record_dispatched_plan, rtdl_node_kind_name, rtdl_recovery_final_text,
+        rtdl_state_name,
         should_replan_after_plan_done, skip_memory_prefetch, start_or_resume_task,
         task_is_session_end,
     };
@@ -3646,6 +3721,8 @@ mod tests {
                         description: description.into(),
                         capability: capability.into(),
                     }],
+                    plan_json: None,
+                    raw_rtdl: None,
                 },
             );
         }
@@ -3709,6 +3786,8 @@ mod tests {
                         capability: "navigate".into(),
                     },
                 ],
+                plan_json: None,
+                raw_rtdl: None,
             },
         );
         let prompt = build_forest_block(&forest, &HashSet::new());
@@ -3795,6 +3874,53 @@ mod tests {
     }
 
     #[test]
+    fn plan_to_json_preserves_operator_tree_and_call_args() {
+        let plan = Plan {
+            plan_id: "7".into(),
+            session_id: "sess".into(),
+            round: 3,
+            root_index: 0,
+            nodes: vec![
+                RtdlNode {
+                    node_kind: RTDL_SEQUENCE,
+                    op_id: "op-1".into(),
+                    description: "do the thing".into(),
+                    children: vec![1],
+                    call: None,
+                },
+                RtdlNode {
+                    node_kind: RTDL_DO,
+                    op_id: "op-2".into(),
+                    description: "move one metre".into(),
+                    children: vec![],
+                    call: Some(CapabilityCall {
+                        call_id: "7:0".into(),
+                        provider_id: "nav2".into(),
+                        contract_id: "robonix/service/navigation/navigate".into(),
+                        args_json: r#"{"distance_m":1.0}"#.into(),
+                    }),
+                },
+            ],
+        };
+        let serialized = plan_to_json(&plan);
+        let value: serde_json::Value = serde_json::from_str(&serialized).expect("valid JSON");
+
+        assert_eq!(value["plan_id"], "7");
+        assert_eq!(value["session_id"], "sess");
+        assert_eq!(value["round"], 3);
+        assert_eq!(value["root_index"], 0);
+        assert_eq!(value["nodes"][0]["node_kind"], "sequence");
+        assert_eq!(value["nodes"][0]["children"][0], 1);
+        assert_eq!(value["nodes"][1]["node_kind"], "do");
+        assert_eq!(value["nodes"][1]["description"], "move one metre");
+        assert_eq!(
+            value["nodes"][1]["call"]["contract_id"],
+            "robonix/service/navigation/navigate",
+        );
+        assert_eq!(value["nodes"][1]["call"]["args"]["distance_m"], 1.0);
+    }
+
+    #[test]
     fn duplicate_in_flight_calls_are_detected_by_canonical_signature() {
         let plan = Plan {
             plan_id: "2".into(),
@@ -3819,6 +3945,8 @@ mod tests {
                 control_only: false,
                 call_signatures: signatures.clone(),
                 steps: Vec::new(),
+                plan_json: None,
+                raw_rtdl: None,
             },
         );
         assert!(duplicate_in_flight_signature(&signatures, &forest).is_some());
@@ -3866,6 +3994,8 @@ mod tests {
                 control_only: false,
                 call_signatures: HashSet::new(),
                 steps: Vec::new(),
+                plan_json: None,
+                raw_rtdl: None,
             },
         );
         let targets = vec!["7".to_string()];

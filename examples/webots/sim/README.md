@@ -82,8 +82,10 @@ ROBONIX_WEBOTS_DOWNLOAD_ALL_ASSETS=1 \
 
 This downloads `assets-R2025a.zip` from the Webots GitHub release through
 `https://ghfast.top/` by default and extracts it into the persistent
-`webots_cache` Docker volume. Later starts reuse the cache and skip the
-download. Override `ROBONIX_WEBOTS_ASSETS_MIRROR` or `ROBONIX_WEBOTS_ASSETS_URL`
+`webots_cache` Docker volume. The partial archive is stored in that volume too,
+so an interrupted launch resumes instead of downloading from zero. The launcher
+waits for this one-time prewarm before starting its sensor-readiness budget.
+Later starts reuse the completed cache and skip the download. Override `ROBONIX_WEBOTS_ASSETS_MIRROR` or `ROBONIX_WEBOTS_ASSETS_URL`
 only if your network needs a different mirror/source.
 
 |  |  |

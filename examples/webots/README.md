@@ -106,8 +106,10 @@ ROBONIX_WEBOTS_DOWNLOAD_ALL_ASSETS=1 \
 ```
 
 This downloads Cyberbotics' `assets-R2025a.zip` release asset through the same
-mirror and stores it in the persistent Webots cache volume. Later runs reuse
-the cache.
+mirror and stores both the partial archive and extracted assets in the persistent
+Webots cache volume. Interrupted launches resume the partial archive; the launcher
+waits for that one-time prewarm before checking sensor readiness, and later runs
+reuse the completed cache without downloading it again.
 
 |  |  |
 |---|---|

@@ -303,7 +303,7 @@ prepare_full_webots_assets() {
     return 0
   fi
 
-  local version url mirror fetch_url cache_dir marker tmp_zip
+  local version url mirror fetch_url cache_dir download_dir marker archive
   version="${ROBONIX_WEBOTS_ASSETS_VERSION:-R2025a}"
   url="${ROBONIX_WEBOTS_ASSETS_URL:-https://github.com/cyberbotics/webots/releases/download/${version}/assets-${version}.zip}"
   mirror="${ROBONIX_WEBOTS_ASSETS_MIRROR:-https://ghfast.top/}"
@@ -316,20 +316,39 @@ prepare_full_webots_assets() {
     esac
   fi
 
-  cache_dir="${ROBONIX_WEBOTS_ASSET_CACHE_DIR:-/root/.cache/Cyberbotics/Webots/assets}"
+  cache_dir="/root/.cache/Cyberbotics/Webots/assets"
+  download_dir="${cache_dir%/assets}/downloads"
   marker="${cache_dir}/.robonix-full-assets-${version}.ok"
+  archive="${download_dir}/assets-${version}.zip.part"
   if [ -f "$marker" ]; then
     echo "[entrypoint] Webots full asset cache already present (${version})"
     return 0
   fi
 
-  mkdir -p "$cache_dir"
-  tmp_zip="/tmp/webots-assets-${version}.zip"
-  echo "[entrypoint] downloading Webots full asset library: ${fetch_url}"
-  wget -S --progress=dot:giga -O "$tmp_zip" "$fetch_url"
+  mkdir -p "$cache_dir" "$download_dir"
+  echo "[entrypoint] downloading Webots full asset library (resumable): ${fetch_url}"
+  local attempt downloaded=0 partial_size
+  for attempt in $(seq 1 10); do
+    if wget -c --tries=3 --timeout=30 --read-timeout=30 \
+        --progress=dot:giga -O "$archive" "$fetch_url"; then
+      if unzip -tq "$archive" >/dev/null; then
+        downloaded=1
+        break
+      fi
+      echo "[entrypoint] asset archive failed validation; restarting download" >&2
+      rm -f "$archive"
+    fi
+    partial_size="$(du -h "$archive" 2>/dev/null | awk '{print $1}')"
+    echo "[entrypoint] asset download attempt ${attempt}/10 failed; retrying from ${partial_size:-0}" >&2
+    sleep 5
+  done
+  if [ "$downloaded" != "1" ]; then
+    echo "[entrypoint] failed to download a valid Webots asset library after 10 resumable attempts" >&2
+    return 1
+  fi
   echo "[entrypoint] extracting Webots full asset library to ${cache_dir}"
-  unzip -q -o "$tmp_zip" -d "$cache_dir"
-  rm -f "$tmp_zip"
+  unzip -q -o "$archive" -d "$cache_dir"
+  rm -f "$archive"
   touch "$marker"
   echo "[entrypoint] Webots full asset library ready: $(find "$cache_dir" -maxdepth 1 -type f | wc -l) cached files"
 }

@@ -22,7 +22,7 @@ odometry / IMU data (via ``SubscribersHub``) or set explicitly via
 
   ==============  ========  ====
   moving          >0.2 m/s   2 s
-  rotating        >10 °/s    5 s
+  rotating         >2 °/s    5 s
   static          —         30 s
   static_long     >5 min   120 s
   ==============  ========  ====
@@ -35,6 +35,11 @@ Env vars:
   ``OBJECT_WATCHDOG_INTERVAL_STATIC_LONG_S`` — long-static interval (default 120.0).
   ``OBJECT_WATCHDOG_STATIC_LONG_THRESHOLD_S`` — long-static threshold (default 300.0).
   ``OBJECT_WATCHDOG_INTERVAL_S`` — fallback / legacy interval (default 2.0).
+  ``OBJECT_WATCHDOG_SKIP_WHEN_ROTATING`` — when ``"1"`` (default), object
+  memories are saved while the robot is stopped (static/static_long) or
+  translating with angular speed at most 2 °/s (moving), but NOT whenever
+  angular speed exceeds 2 °/s — then only the pose-grid recorder captures
+  position memories.
   ``OBJECT_WATCHDOG_CENTER_MARGIN_PX`` — border band (px) within which a
   projected object centre counts as "at the edge" and is skipped (default 0.0).
 """
@@ -86,6 +91,24 @@ _INTERVAL_STATIC_LONG_S = float(os.environ.get(
 _STATIC_LONG_THRESHOLD_S = float(os.environ.get(
     "OBJECT_WATCHDOG_STATIC_LONG_THRESHOLD_S", "300.0"))
 
+# When enabled (default), object memories are saved in every motion state
+# except rotation — translation is eligible only while angular speed stays
+# at or below 2 °/s. Faster rotation blurs / offsets the frame, so only the
+# pose-grid recorder captures position memories then.
+_SKIP_WHEN_ROTATING = os.environ.get(
+    "OBJECT_WATCHDOG_SKIP_WHEN_ROTATING", "1") in ("1", "true", "yes")
+
+# Scene's robot record describes the observer itself, while picture frames are
+# known open-vocabulary noise in the office scene. Neither is useful as an
+# object observation in long-term memory.
+_IGNORED_MEMORY_CLASSES = frozenset({"picture_frame", "robot"})
+
+
+def _normalise_class_name(value: Any) -> str:
+    """Return the canonical spelling used by memory-class filters."""
+    return str(value or "").strip().lower().replace(" ", "_").replace("-", "_")
+
+
 # Motion state names
 _MOVING = "moving"
 _ROTATING = "rotating"
@@ -94,11 +117,20 @@ _STATIC_LONG = "static_long"
 
 # Motion detection thresholds
 _MOVING_LINEAR_VEL_THRESH = 0.2       # m/s
-_ROTATING_ANGULAR_VEL_THRESH = 10.0   # deg/s, converted to rad/s below
+_ROTATING_ANGULAR_VEL_THRESH = 2.0    # deg/s, converted to rad/s below
 _ROTATING_ANGULAR_VEL_THRESH_RAD = _ROTATING_ANGULAR_VEL_THRESH * (math.pi / 180.0)
 # Linear vel below this AND angular vel below → static
 _STATIC_LINEAR_VEL_MAX = 0.2
-_STATIC_ANGULAR_VEL_MAX_RAD = 10.0 * (math.pi / 180.0)
+_STATIC_ANGULAR_VEL_MAX_RAD = 2.0 * (math.pi / 180.0)
+# Motion is sampled at this fixed fast cadence, independent of the save
+# interval.  Sampling only on the adaptive save interval (30s when static)
+# lets an in-place rotation wrap its heading >180° between samples, which
+# the pose-delta below then reads as ~0 angular velocity — so the robot
+# spins yet object memories keep saving.  A short fixed cadence keeps
+# consecutive heading deltas well under π so rotation is always caught.
+_MOTION_SAMPLE_INTERVAL_S = float(
+    os.environ.get("OBJECT_WATCHDOG_MOTION_SAMPLE_INTERVAL_S", "0.5")
+)
 
 
 def _compute_interval(motion_state: str) -> float:
@@ -161,6 +193,11 @@ class ObjectWatchdog:
         self._odom_topic: str = os.environ.get(
             "OBJECT_WATCHDOG_ODOM_TOPIC", "/odom",
         )
+        # Last map-frame pose (x, y, yaw, ts) seen, for pose-delta motion
+        # detection.  Odometry twist under-reports rotation during in-place
+        # sweeps, so the watchdog also derives angular velocity from the
+        # SLAM-corrected heading between consecutive ticks.
+        self._last_pose_xyyaw: Optional[tuple] = None
 
     # ── lifecycle ──────────────────────────────────────────────────────
 
@@ -186,10 +223,13 @@ class ObjectWatchdog:
         # Seed the seen-objects map from whatever the registry already
         # holds so the first tick only reacts to genuinely new arrivals.
         try:
-            objs, _surfs = await self._registry.snapshot()
+            objs = await self._registry.snapshot()
             for o in objs.values():
-                if not o.missing:
-                    self._seen_objects.setdefault(o.cls, []).extend(
+                if (
+                    not o.missing
+                    and _normalise_class_name(o.label) not in _IGNORED_MEMORY_CLASSES
+                ):
+                    self._seen_objects.setdefault(o.label, []).extend(
                         [float(o.pose.x), float(o.pose.y)]
                     )
             total = sum(len(v) // 2 for v in self._seen_objects.values())
@@ -201,24 +241,38 @@ class ObjectWatchdog:
         log.info(
             "object_watchdog: started (dynamic intervals: "
             "moving=%.1fs, rotating=%.1fs, static=%.1fs, static_long=%.1fs, "
-            "threshold=%.0fs, %d known, max_images=%d, dedup=per-class)",
+            "threshold=%.0fs, skip_when_rotating=%s, %d known, "
+            "max_images=%d, dedup=per-class)",
             _INTERVAL_MOVING_S, _INTERVAL_ROTATING_S,
             _INTERVAL_STATIC_S, _INTERVAL_STATIC_LONG_S,
             _STATIC_LONG_THRESHOLD_S,
+            "yes" if _SKIP_WHEN_ROTATING else "no",
             total, self._max_images_per_object,
         )
 
+        prev_state: Optional[str] = None
+        last_save_ts = 0.0
         while self._running:
             start = time.monotonic()
             try:
-                await self._tick()
+                # ── Motion sampled at a fast fixed cadence, decoupled from
+                # the save interval (see _MOTION_SAMPLE_INTERVAL_S).  The
+                # save interval is then applied as a gate on _tick, so a
+                # short rotation burst is caught within one sample instead
+                # of being averaged to ~0 over a 30s static window.
+                self._motion_state = self._current_motion_state()
+                if self._motion_state != prev_state:
+                    log.info("object_watchdog: motion %s → %s",
+                             prev_state or "boot", self._motion_state)
+                    prev_state = self._motion_state
+                if start - last_save_ts >= _compute_interval(self._motion_state):
+                    last_save_ts = start
+                    await self._tick()
             except Exception:
                 log.debug("object_watchdog: tick error", exc_info=True)
 
-            # ── Dynamic interval: detect motion → choose interval ──
-            interval = self._select_interval()
             elapsed = time.monotonic() - start
-            sleep_s = max(0.05, interval - elapsed)
+            sleep_s = max(0.05, _MOTION_SAMPLE_INTERVAL_S - elapsed)
             await asyncio.sleep(sleep_s)
 
     def stop(self) -> None:
@@ -229,16 +283,48 @@ class ObjectWatchdog:
 
     # ── dynamic interval ──────────────────────────────────────────────
 
-    def _select_interval(self) -> float:
-        """Detect motion state and return the appropriate interval."""
-        # 1. External override
+    def _current_motion_state(self) -> str:
+        """Return the current motion state (external override or odometry)."""
         if self._motion_override is not None:
-            self._motion_state = self._motion_override
-        else:
-            # 2. Auto-detect from odometry
-            self._motion_state = self._detect_motion()
+            return self._motion_override
+        return self._detect_motion()
 
+    def _select_interval(self) -> float:
+        """Detect motion state and return the appropriate polling interval."""
+        self._motion_state = self._current_motion_state()
         return _compute_interval(self._motion_state)
+
+    def _read_pose_xyyaw(self) -> Optional[tuple]:
+        """Read the robot's map-frame pose ``(x, y, yaw, ts)`` from the hub.
+
+        Returns ``None`` when no fresh map-frame pose is available.  This is
+        the SLAM-corrected pose (the same source the pose-grid recorder
+        uses), so its heading is reliable — unlike odometry twist, which
+        under-reports rotation during in-place sweeps.
+        """
+        if self._hub is None or not self._hub.has("pose"):
+            return None
+        try:
+            msg, stamp_unix, _count = self._hub.latest("pose")
+        except Exception:
+            return None
+        if msg is None:
+            return None
+        if stamp_unix and stamp_unix > 0 and time.time() - stamp_unix > 2.0:
+            return None  # stale pose — don't derive velocity from it
+        try:
+            p = (msg.pose.pose
+                 if hasattr(msg, "pose") and hasattr(msg.pose, "pose")
+                 else msg.pose)
+            q = p.orientation
+            x = float(p.position.x)
+            y = float(p.position.y)
+            yaw = math.atan2(2.0 * (q.w * q.z + q.x * q.y),
+                             1.0 - 2.0 * (q.y * q.y + q.z * q.z))
+            ts = float(stamp_unix) if stamp_unix and stamp_unix > 0 else time.time()
+            return (x, y, yaw, ts)
+        except Exception:
+            return None
 
     def _detect_motion(self) -> str:
         """Detect robot motion state from hub odometry data.
@@ -257,13 +343,17 @@ class ObjectWatchdog:
                         # Try common odometry field names
                         twist = getattr(msg, "twist", None)
                         if twist is not None:
-                            linear = getattr(twist, "linear", None)
+                            # nav_msgs/Odometry nests Twist inside
+                            # TwistWithCovariance (twist.twist.linear/angular);
+                            # tolerate a flat Twist too.
+                            tw = getattr(twist, "twist", twist)
+                            linear = getattr(tw, "linear", None)
                             if linear is not None:
                                 linear_vel = max(
                                     abs(float(getattr(linear, "x", 0))),
                                     abs(float(getattr(linear, "y", 0))),
                                 )
-                            angular = getattr(twist, "angular", None)
+                            angular = getattr(tw, "angular", None)
                             if angular is not None:
                                 angular_vel = abs(float(getattr(angular, "z", 0)))
                         # Alternative: direct speed fields
@@ -274,14 +364,37 @@ class ObjectWatchdog:
                                                  or getattr(msg, "angular_speed", 0)))
                     break
 
-        # ── Classify ──
-        if linear_vel > _MOVING_LINEAR_VEL_THRESH:
-            self._static_start = None
-            return _MOVING
+        # ── Supplement with map-frame pose deltas ──
+        # Odometry twist frequently reads ~0 angular velocity during an
+        # in-place sweep (diff-drive odom may only populate twist while
+        # translating), which mis-classifies rotation as static and lets
+        # object memories be saved mid-rotation.  Deriving velocities from
+        # consecutive SLAM poses closes that gap: any heading change shows
+        # up as angular_vel, any position change as linear_vel.
+        pose = self._read_pose_xyyaw()
+        if pose is not None:
+            if self._last_pose_xyyaw is not None:
+                x, y, yaw, ts = pose
+                lx, ly, lyaw, lts = self._last_pose_xyyaw
+                dt = ts - lts
+                if dt > 1e-3:
+                    dpos = math.hypot(x - lx, y - ly)
+                    dyaw = abs(((yaw - lyaw + math.pi) % (2.0 * math.pi)) - math.pi)
+                    linear_vel = max(linear_vel, dpos / dt)
+                    angular_vel = max(angular_vel, dyaw / dt)
+            self._last_pose_xyyaw = pose
 
+        # ── Classify ──
+        # Rotation wins over translation: any angular speed above the
+        # configured 2 °/s safety threshold suppresses object memories,
+        # including curved motion where linear speed is also above 0.2 m/s.
         if angular_vel > _ROTATING_ANGULAR_VEL_THRESH_RAD:
             self._static_start = None
             return _ROTATING
+
+        if linear_vel > _MOVING_LINEAR_VEL_THRESH:
+            self._static_start = None
+            return _MOVING
 
         # Static — track duration for long-static transition
         now = time.monotonic()
@@ -316,13 +429,13 @@ class ObjectWatchdog:
         """Coarse grid key for node/image-count tracking."""
         gx = round(float(obj.pose.x))
         gy = round(float(obj.pose.y))
-        return f"{obj.cls}@{gx},{gy}"
+        return f"{obj.label}@{gx},{gy}"
 
     def _is_duplicate(self, obj) -> bool:
         """Check whether *obj* is within its per-class dedup radius of any
         already-seen object of the same class, using actual world-frame
         positions (not rounded grid cells)."""
-        cls = obj.cls
+        cls = obj.label
         positions = self._seen_objects.get(cls)
         if not positions:
             return False
@@ -336,14 +449,29 @@ class ObjectWatchdog:
 
     def _mark_seen(self, obj) -> None:
         """Record the actual world-frame position of a saved object."""
-        self._seen_objects.setdefault(obj.cls, []).extend(
+        self._seen_objects.setdefault(obj.label, []).extend(
             [float(obj.pose.x), float(obj.pose.y)]
         )
 
     async def _tick(self) -> None:
-        objs, _surfs = await self._registry.snapshot()
+        # ── Motion gate: save object memories in every motion state except
+        # rotation.  Above 2 °/s the frame blurs / offsets and would
+        # mis-annotate, so this watchdog holds off even during curved motion;
+        # only the pose-grid recorder captures position memories then.
+        # Straight translation (moving) and stopped states are both saved;
+        # the per-object
+        # detection-time pose keeps the marker aligned even mid-traversal.
+        if _SKIP_WHEN_ROTATING and self._motion_state == _ROTATING:
+            return
+
+        objs = await self._registry.snapshot()
         visible: Dict[str, Any] = {
-            o.object_id: o for o in objs.values() if not o.missing
+            o.object_id: o
+            for o in objs.values()
+            if (
+                not o.missing
+                and _normalise_class_name(o.label) not in _IGNORED_MEMORY_CLASSES
+            )
         }
 
         # ── 1. Find genuinely new objects (spatial + temporal dedup) ──
@@ -353,7 +481,7 @@ class ObjectWatchdog:
         new_objects: list = []
         same_tick_positions: Dict[str, list] = {}  # cls → [x1,y1, x2,y2, ...]
         for obj in visible.values():
-            cls = obj.cls
+            cls = obj.label
             # Cross-tick dedup.
             if self._is_duplicate(obj):
                 continue
@@ -376,7 +504,7 @@ class ObjectWatchdog:
             log.info(
                 "object_watchdog: %d new object(s): %s",
                 len(new_objects),
-                ", ".join(f"{o.cls}@{o.pose.x:.1f},{o.pose.y:.1f}"
+                ", ".join(f"{o.label}@{o.pose.x:.1f},{o.pose.y:.1f}"
                           for o in new_objects),
             )
 
@@ -395,24 +523,30 @@ class ObjectWatchdog:
                     h, w = bgr.shape[:2]
                     px, py = self._project_with_detect_pose(obj, w, h)
                     if px is None:
-                        px, py = self._project_to_pixel(obj, w, h)
+                        px, py = self._bbox_center(obj)
                 else:
                     bgr = await loop.run_in_executor(None, self._capture_raw_bgr)
                     if bgr is None:
                         log.warning(
                             "object_watchdog: raw frame capture failed — "
-                            "skipping %s", obj.cls,
+                            "skipping %s", obj.label,
                         )
                         continue
                     h, w = bgr.shape[:2]
                     px, py = self._project_to_pixel(obj, w, h)
+                if px is None or py is None:
+                    log.info(
+                        "object_watchdog: skip %s — no matching camera geometry",
+                        obj.label,
+                    )
+                    continue
                 # Skip objects whose centre projects onto / past the image
                 # edge — a border-clamped marker records a useless frame
                 # (the object is out of view).
                 if not self._center_in_frame(px, py, w, h):
                     log.info(
                         "object_watchdog: skip %s — centre (%.0f, %.0f) "
-                        "off-frame %dx%d", obj.cls, px, py, w, h,
+                        "off-frame %dx%d", obj.label, px, py, w, h,
                     )
                     continue
                 dpx, dpy = self._clamp_to_pixel(px, py, w, h)
@@ -422,7 +556,7 @@ class ObjectWatchdog:
                 )
                 if not img_b64:
                     log.warning("object_watchdog: annotate failed for %s — retry",
-                                obj.cls)
+                                obj.label)
                     continue
                 self._mark_seen(obj)
                 ok = await self._save_object(
@@ -454,14 +588,12 @@ class ObjectWatchdog:
                     node_id = self._grid_node.get(key)
                     if node_id is None or node_id == 0:
                         continue
-                    # Use the detection-time camera pose (stamped on the
-                    # record) instead of a live TF lookup, which is often
-                    # unavailable here and used to fall through to the
-                    # image-centre fallback. Skip the object entirely when
-                    # the stored pose is missing / unusable or the object is
-                    # behind the camera — never default to image centre.
-                    px, py = self._project_with_detect_pose(obj, w, h)
-                    if px is None:
+                    # This frame was captured now, so it must be projected
+                    # through the current camera transform. A detection-time
+                    # transform belongs to an older frame and would move the
+                    # marker onto empty wall or floor after the robot turns.
+                    px, py = self._project_world_to_pixel(obj, w, h)
+                    if px is None or py is None:
                         continue
                     if not self._center_in_frame(px, py, w, h):
                         continue
@@ -513,7 +645,7 @@ class ObjectWatchdog:
             cv2.circle(arr, (px, py), dot_r, (0, 0, 255), -1)
             cv2.circle(arr, (px, py), dot_r + 2, (255, 255, 255), 1)
 
-            label = str(obj.cls or "?")
+            label = str(obj.label or "?")
             x, y, z = float(obj.pose.x), float(obj.pose.y), float(obj.pose.z)
             bb = getattr(obj, 'last_bbox_2d', None)
             if bb is not None and len(bb) == 4:
@@ -544,39 +676,21 @@ class ObjectWatchdog:
             return ""
 
     def _project_to_pixel(self, obj, img_w: int, img_h: int):
-        """Return the object's projected centre as *unclamped* ``(u, v)``.
+        """Project an object onto a newly captured current camera frame.
 
-        The marker must land on the object the MemoryNode describes, and
-        the node's identity is the object's *world* pose. So the primary
-        method re-projects ``obj.pose`` (world) into the current camera
-        frame through the full 6-DoF camera↔map transform plus intrinsics
-        — this stays correct after the robot has moved.
-
-        Coordinates are returned unclamped so the caller can reject an
-        off-frame centre before saving; clamp with ``_clamp_to_pixel``.
-
-        The VLM ``last_bbox_2d`` is only a fallback when camera geometry
-        is unavailable. It is otherwise *stale*: the bbox is cached from
-        an earlier detection frame, so reusing it against a later captured
-        frame lands the marker on the wrong object (the reported
-        image↔node mismatch).
+        Coordinates stay unclamped so callers can reject off-frame objects.
+        No cached bbox or image-centre fallback is allowed: those coordinates
+        describe a different frame and would create a false image memory.
         """
-        px, py = self._project_world_to_pixel(obj, img_w, img_h)
-        if px is not None:
-            return px, py
+        return self._project_world_to_pixel(obj, img_w, img_h)
 
-        # Fallback: last known 2D bbox from the VLM detector. Only used
-        # when the camera transform / intrinsics are missing.
-        bb = getattr(obj, 'last_bbox_2d', None)
-        if bb is not None and len(bb) == 4:
-            return float((bb[0] + bb[2]) / 2), float((bb[1] + bb[3]) / 2)
-
-        log.warning(
-            "object_watchdog: no camera geometry for %s — annotating at "
-            "image centre (marker position is unreliable)",
-            getattr(obj, "object_id", "?"),
-        )
-        return float(img_w) / 2.0, float(img_h) / 2.0
+    @staticmethod
+    def _bbox_center(obj):
+        """Return a detection bbox centre, or ``(None, None)`` if absent."""
+        bb = getattr(obj, "last_bbox_2d", None)
+        if bb is None or len(bb) != 4:
+            return None, None
+        return float((bb[0] + bb[2]) / 2), float((bb[1] + bb[3]) / 2)
 
     def _center_in_frame(self, u: float, v: float, img_w: int, img_h: int) -> bool:
         """Return True when the object's projected centre lies inside the
@@ -841,7 +955,7 @@ class ObjectWatchdog:
         ox, oy = float(obj.pose.x), float(obj.pose.y)
         region = self._lookup_region(ox, oy)
         if region:
-            log.info("object_watchdog: %s@%.1f,%.1f → region=%s", obj.cls, ox, oy, region)
+            log.info("object_watchdog: %s@%.1f,%.1f → region=%s", obj.label, ox, oy, region)
         if img_w and img_h:
             if detect_cam_to_map is not None:
                 camera_params = self._camera_params_from_transform(
@@ -858,14 +972,14 @@ class ObjectWatchdog:
                 "ts": now_ns,
                 "level": "Info",
                 "tag": "scene",
-                "msg": f"observed new object: {obj.cls}",
+                "msg": f"observed new object: {obj.label}",
             },
             "spatial": {
                 "origin": frame_id,
                 "objects": [
                     {
                         "obj_id": obj.object_id,
-                        "label": obj.cls,
+                        "label": obj.label,
                         "x": ox,
                         "y": oy,
                         "z": float(obj.pose.z),
@@ -895,7 +1009,7 @@ class ObjectWatchdog:
                 key = self._grid_key(obj)
                 self._grid_node[key] = node_id
             log.info("object_watchdog: %s (%s) → node %s",
-                     obj.object_id, obj.cls, node_id)
+                     obj.object_id, obj.label, node_id)
             return True
         except Exception:
             log.debug(
@@ -907,9 +1021,8 @@ class ObjectWatchdog:
     async def _append_image(self, node_id: int, obj, img_b64: str) -> bool:
         """POST an additional frame to an existing memory node.
 
-        Uses memgraph's Scene Hook with ``parent_node_id`` to create a
-        child node that shares the same object identity, or appends to
-        the existing node's ``image_refs``.
+        Uses memgraph's Scene Hook append operation so the frame is added
+        to the original node's ``image_refs`` without creating a child node.
         """
         import httpx
 
@@ -921,14 +1034,14 @@ class ObjectWatchdog:
                 "ts": now_ns,
                 "level": "Info",
                 "tag": "scene",
-                "msg": f"observed {obj.cls} from another angle",
+                "msg": f"observed {obj.label} from another angle",
             },
             "spatial": {
                 "origin": "world",
                 "objects": [
                     {
                         "obj_id": obj.object_id,
-                        "label": obj.cls,
+                        "label": obj.label,
                         "x": float(obj.pose.x),
                         "y": float(obj.pose.y),
                         "z": float(obj.pose.z),
@@ -938,6 +1051,7 @@ class ObjectWatchdog:
             "image_base64": img_b64,
             "parent_node_id": node_id,
             "time_range": {"start_ts": now_ns, "end_ts": now_ns},
+            "kv": {"append_image_ref": True},
         }
 
         try:

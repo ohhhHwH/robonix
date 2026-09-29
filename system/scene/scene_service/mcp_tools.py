@@ -99,6 +99,16 @@ _MEMGRAPH_HOOK_URL = os.environ.get(
 _SAVE_COOLDOWN_S = 2.0
 _last_save_ts: float = 0.0
 _last_save_ids: frozenset = frozenset()
+_MEMORY_IGNORED_CLASSES = frozenset({"picture_frame", "robot"})
+
+
+def _memory_visible_objects(objects: list[SceneObject]) -> list[SceneObject]:
+    """Exclude known noise and Scene's self-object from memory snapshots."""
+    return [
+        obj for obj in objects
+        if str(obj.cls or "").strip().lower().replace(" ", "_").replace("-", "_")
+        not in _MEMORY_IGNORED_CLASSES
+    ]
 
 
 async def _try_save_observation(visible_objects: list) -> None:
@@ -437,11 +447,13 @@ async def list_objects(_req: ListObjects_Request) -> ListObjects_Response:
             if annotation.kind == "room"
         )
 
-    # Scene Hook: auto-save observation when objects are visible.
-    # This is fire-and-forget — list_objects returns immediately
-    # regardless of whether the save succeeds.
-    if visible:
-        asyncio.create_task(_try_save_observation(visible))
+    # Scene Hook: auto-save useful physical observations. Keep self/noise
+    # records in the query response, but never persist them as image memory.
+    # This is fire-and-forget — list_objects returns immediately regardless
+    # of whether the save succeeds.
+    memory_visible = _memory_visible_objects(visible)
+    if memory_visible:
+        asyncio.create_task(_try_save_observation(memory_visible))
 
     return ListObjects_Response(
         objects=objects,

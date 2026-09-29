@@ -59,15 +59,44 @@ _DEFAULT_OPEN_VOCAB = [
     "phone", "tablet",
     "box", "cardboard box", "tray", "basket", "trash bin",
     "tool", "screwdriver", "wrench", "tape",
-    "plant", "potted plant", "lamp", "clock", "picture frame",
+    "plant", "potted plant", "lamp", "clock",
     "snack", "fruit", "apple", "banana",
     "door", "doorway", "fire extinguisher", "person",
 ]
 
 _BG_CLASSES = frozenset({"floor", "wall", "ceiling", "carpet"})
 
-# Classes we never want to insert (unstable / outdoor / not useful for indoor robot).
-_IGNORED_CLASSES = frozenset({"person"})
+# Classes we never want to insert (unstable or not useful for indoor robots).
+# Labels are canonicalized before this check so environment overrides such as
+# ``picture frame`` cannot re-enable the filtered ``picture_frame`` noise class.
+_IGNORED_CLASSES = frozenset({"person", "picture_frame"})
+
+_FLOOR_NOISE_CLASSES = frozenset({
+    "table", "desk", "couch", "sofa", "shelf", "bookshelf", "cabinet",
+    "drawer", "monitor", "monitor_stand", "computer_tower",
+})
+
+
+def _is_floor_noise(cls_name: str, points) -> bool:
+    """Return whether a 3D detection is dominated by floor points.
+
+    Sparse or malformed clouds are left to the existing point-count filter.
+    Any class wholly on the floor is noise; furniture is also rejected when
+    its mean height is below 10 cm, even if a few leaked wall points make its
+    maximum height look plausible.
+    """
+    pts = np.asarray(points)
+    if pts.ndim != 2 or pts.shape[0] < 4 or pts.shape[1] < 3:
+        return False
+    z = pts[:, 2]
+    z = z[np.isfinite(z)]
+    if z.shape[0] < 4:
+        return False
+    if float(np.percentile(z, 90)) < 0.05:
+        return True
+    return _canon_class(cls_name) in _FLOOR_NOISE_CLASSES and (
+        float(z.max()) < 0.30 or float(z.mean()) < 0.10
+    )
 
 
 def _resolved_classes() -> list[str]:
@@ -1045,7 +1074,8 @@ class ConceptGraphsDetector:
 
         # Filter ignored classes BEFORE running SAM (saves work).
         keep = np.array([
-            str(names.get(int(cidx), f"class_{cidx}")).lower() not in _IGNORED_CLASSES
+            _canon_class(str(names.get(int(cidx), f"class_{cidx}")))
+            not in _IGNORED_CLASSES
             for cidx in cls_idx
         ], dtype=bool)
         if not keep.any():
@@ -1197,29 +1227,9 @@ class ConceptGraphsDetector:
             # / "trash bin" but the points are obviously the floor.
             # Drop them before they reach the merge pipeline.
             try:
-                pts_chk = np.asarray(entry["pcd"].points)
-                if pts_chk.shape[0] >= 4:
-                    z_max = float(pts_chk[:, 2].max())
-                    z_p90 = float(np.percentile(pts_chk[:, 2], 90))
-                    # Class-specific minimum height: a desk top sits
-                    # ≥ 0.55 m above the floor, a chair seat ≥ 0.30 m,
-                    # a cup on a table ≥ 0.50 m. If none of those hold
-                    # it's almost certainly floor noise.
-                    floor_classes = {
-                        "table", "desk", "couch", "sofa", "shelf",
-                        "bookshelf", "cabinet", "drawer", "monitor",
-                        "monitor stand", "computer tower",
-                    }
-                    if cls_name in floor_classes and z_max < 0.30:
-                        log.debug(
-                            "[scene-cg] drop %s det at z_max=%.2f (floor noise)",
-                            cls_name, z_max,
-                        )
-                        continue
-                    if z_p90 < 0.05:
-                        # Anything whose 90th percentile is on the
-                        # floor cell, drop regardless of class.
-                        continue
+                if _is_floor_noise(cls_name, entry["pcd"].points):
+                    log.debug("[scene-cg] drop %s det (floor noise)", cls_name)
+                    continue
             except Exception:
                 pass
             d = {

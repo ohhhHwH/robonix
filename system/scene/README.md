@@ -312,8 +312,9 @@ Hugging Face mirror endpoint (default `https://hf-mirror.com`); the canonical
 
 | Env | Default | Notes |
 |---|---|---|
-| `SCENE_OPEN_VOCAB_CLASSES` | (55-entry default) | comma-separated YOLO-World class list |
+| `SCENE_OPEN_VOCAB_CLASSES` | (built-in indoor-office list) | comma-separated YOLO-World class list; `person` and `picture_frame` remain filtered |
 | `SCENE_CG_FORCE_CPU` | `` | set to `1` to force CPU mode (~3× slower) |
+| `SCENE_DETECT_PERIOD_S` | `0.6` | seconds between ConceptGraphs detector passes; Docker and native launchers both forward this override |
 | `SCENE_PERCEPTION_WAIT_S` | `30` | how long to wait for camera providers before falling back |
 | `SCENE_POSE_MAX_AGE_S` | `2.0` | maximum receipt age in seconds for pose/odometry used in camera-to-world projection; stale samples withhold detections |
 | `SCENE_YOLO_WORLD_WEIGHTS` | `/opt/models/yolov8l-world.pt` | path inside container |
@@ -328,6 +329,9 @@ Hugging Face mirror endpoint (default `https://hf-mirror.com`); the canonical
 | `SCENE_CG_SAME_CLASS_MERGE_DIST_M` | `0.4` | lenient dedup: fold two SAME-class (or same `SCENE_CG_MERGE_CLASS_GROUPS` bucket) records whose centroids are within this distance, regardless of visual sim (kills "one keyboard → three"). `0` disables |
 | `SCENE_CG_MERGE_CLASS_GROUPS` | `` | opt-in confusable-class reconciliation, e.g. `chair,table,desk;sofa,couch` — listed classes share one merge bucket so label flicker across the group collapses while distinct, distant objects stay separate. Empty = off (never relabels) |
 | `SCENE_OBJECT_TTL_SEC` | `30` | how long a soft-evicted (`missing`) object is kept so a re-detection can re-bind its id + observation_count before it is hard-pruned; decouples object identity from per-tick uuid churn |
+| `SCENE_OBJECT_WATCHDOG` | `1` | autonomously save newly observed objects to the memory Scene Hook; all object-memory writers exclude `picture_frame` noise and Scene's `robot` self-record |
+| `OBJECT_WATCHDOG_SKIP_WHEN_ROTATING` | `1` | suppress object observations whenever angular speed exceeds 2 °/s, including curved translation; pose-grid place images still capture one 90° heading bucket per 2 m cell |
+| `OBJECT_WATCHDOG_MOTION_SAMPLE_INTERVAL_S` | `0.5` | cadence for odometry and map-pose motion classification |
 | `SCENE_GRAPH_IMAGE_RELATIONS` | `true` | VLM-primary relations: one image-grounded VLM call (projected numbered boxes) owns relational + semantic edges. `false` forces the legacy text-only per-pair inference (also the automatic fallback when no camera frame bundle is available) |
 | `SCENE_GRAPH_IMAGE_MAX_DIM` | `960` | longest-side pixel cap for the annotated frame sent to the VLM; bounds image token cost |
 | `SCENE_VLM_FRAME_CHANGE_THRESHOLD` / `SCENE_GRAPH_IMAGE_CHANGE_THRESHOLD` | `0.01` / `0.01` | maximum normalized RGB RMS across 4x4 blocks in a 32x32 sample; ignores JPEG/sensor noise without averaging away small local objects |
@@ -472,7 +476,7 @@ The cam panel shows the same RGB + depth frames the perception pipeline consumes
 
 **Object set collapses (e.g. 9 → 1) within minutes** — a transient cleanup cull used to hard-delete records and reset `observation_count`. Records are now soft-evicted (`missing`) and re-bound by class+pose on re-detection within `SCENE_OBJECT_TTL_SEC`; raise it if objects briefly leave view longer than 30 s.
 
-**"Desk" detected on the floor** — YOLO-World mask leaked past the object's footprint and the depth points are floor. Floor-noise filter already drops detections of falling-class types if `pcd.z_max < 0.30`; adjust the floor_classes list in `perception_concept_graphs.py` if your robot has a low desk.
+**"Desk" detected on the floor** — YOLO-World mask leaked past the object's footprint and the depth points are floor. The floor-noise filter drops furniture when `pcd.z_max < 0.30` or its mean height is below 0.10 m, and drops every class whose 90th-percentile height is below 0.05 m. Adjust `_FLOOR_NOISE_CLASSES` in `perception_concept_graphs.py` if the robot must perceive unusually low furniture.
 
 **No detections firing** — usually a topic mismatch. Check `docker logs robonix_scene` for `auto-discover 'rgb' / 'depth'` lines; if missing, scene didn't find a cap on atlas advertising `robonix/primitive/camera/rgb` over ROS2. `rbnx caps` should list your camera primitive.
 

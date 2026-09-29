@@ -243,6 +243,33 @@ allow_x11_for_docker
 DC=(docker compose --project-name "$ROBONIX_SIM_PROJECT" "${CF[@]}")
 "${DC[@]}" up --build -d
 
+# A first full-library prewarm can outlast sensor readiness. Keep the launcher
+# attached while the persistent archive resumes, and only start the normal
+# Webots readiness budget after extraction has completed.
+if [[ "${ROBONIX_WEBOTS_DOWNLOAD_ALL_ASSETS:-0}" == "1" ]]; then
+    asset_version="${ROBONIX_WEBOTS_ASSETS_VERSION:-R2025a}"
+    asset_marker="/root/.cache/Cyberbotics/Webots/assets/.robonix-full-assets-${asset_version}.ok"
+    echo "[sim/start] waiting for persistent Webots full asset cache (${asset_version})..."
+    asset_ready=0
+    for _ in $(seq 1 120); do
+        if [[ "$(docker inspect -f '{{.State.Running}}' "$SIM_CT" 2>/dev/null || true)" != "true" ]]; then
+            echo "[sim/start] error: simulation container exited during asset prewarm" >&2
+            docker logs --tail 120 "$SIM_CT" 2>&1 || true
+            exit 1
+        fi
+        if docker exec "$SIM_CT" test -f "$asset_marker" 2>/dev/null; then
+            asset_ready=1
+            echo "[sim/start] persistent Webots full asset cache ready"
+            break
+        fi
+        sleep 30
+    done
+    if [[ "$asset_ready" != "1" ]]; then
+        echo "[sim/start] error: Webots full asset prewarm exceeded 60 minutes" >&2
+        exit 1
+    fi
+fi
+
 # Wait for actual sensor messages. `ros2 topic list` is not a readiness
 # signal: the ROS daemon can retain graph entries from an earlier deployment
 # after Webots restarts, and the old check also continued after its timeout.

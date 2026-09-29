@@ -308,3 +308,24 @@ if __name__ == "__main__":
                         obj.teardown_method()
     print(f"\n{passed} passed, {failed} failed")
     sys.exit(1 if failed else 0)
+
+
+def test_clean_slate_preserves_plan_memory(tmp_path, monkeypatch):
+    """Startup removes graph/images while retaining saved RTDL plans."""
+    from memory_service import service as service_module
+
+    memory_dir = tmp_path / "memory"
+    images_dir = tmp_path / "images"
+    memory_dir.mkdir()
+    images_dir.mkdir()
+    (memory_dir / "graph_store.json").write_text("{}")
+    (memory_dir / "ptdl_store.json").write_text('{"queries": []}')
+    (images_dir / "frame.jpg").write_bytes(b"frame")
+    monkeypatch.setattr(service_module, "MEMORY_DIR", str(memory_dir))
+    monkeypatch.setattr(service_module, "IMAGES_DIR", str(images_dir))
+
+    service_module._clean_slate()
+
+    assert not (memory_dir / "graph_store.json").exists()
+    assert (memory_dir / "ptdl_store.json").read_text() == '{"queries": []}'
+    assert list(images_dir.iterdir()) == []

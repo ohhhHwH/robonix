@@ -45,6 +45,10 @@ print(f'Nodes: {svc.graph.count()}')
   frame in `origin`; missing origins are rejected rather than labelled
   `world`.
 - Falls back to deterministic hash embeddings when model unavailable
+- Normal startup clears `graph_store.json` and observation images unless
+  `MEMGRAPH_KEEP_DATA=1`; it always preserves `ptdl_store.json` so saved RTDL
+  plans survive restarts. The explicit HTTP `POST /reset` operation clears all
+  three stores, including saved RTDL plans.
 
 ## Status
 

@@ -46,7 +46,7 @@ def _log_environment() -> None:
     log.info("cwd      : %s", os.getcwd())
     log.info("embedding: enabled=%s (set MEMGRAPH_ENABLE_EMBEDDING=1 to activate)",
              _ENABLE_EMBEDDING)
-    log.info("clean_start: enabled=%s (set MEMGRAPH_KEEP_DATA=1 to preserve)",
+    log.info("clean_start: enabled=%s (graph/images only; plan memory always preserved)",
              not _KEEP_DATA)
     model_path = os.environ.get("EMBEDDING_MODEL_PATH", "")
     if model_path:
@@ -82,33 +82,30 @@ MEMORY_DIR = str(
     Path(os.environ.get("AGENT_MEMORY_DIR", _DEFAULT_MEMORY_DIR))
     .resolve()
 )
+IMAGES_DIR = str(Path(__file__).resolve().parent.parent / "data" / "images")
 
-# ── 2a. Clean slate: wipe persisted data on every boot ────────────────
-# The memory graph is ephemeral per session — delete prior graph and
-# all observation images so each rbnx boot starts from a clean state.
-# Set MEMGRAPH_KEEP_DATA=1 to opt out (e.g. debugging persistence bugs).
+# ── 2a. Clean slate: wipe ephemeral data on every boot ────────────────
+# The observation graph is ephemeral per session — delete the prior graph
+# and all observation images so each rbnx boot starts from a clean state.
+# Saved RTDL plan memory (ptdl_store.json) is deliberately preserved: it is
+# long-term knowledge (successful plans to replay for repeated questions) and
+# must survive a restart. Set MEMGRAPH_KEEP_DATA=1 to additionally preserve
+# the observation graph (e.g. debugging persistence bugs).
 _KEEP_DATA = os.environ.get("MEMGRAPH_KEEP_DATA", "0") in ("1", "true", "yes")
 
 def _clean_slate() -> None:
-    """Delete graph_store.json, ptdl_store.json, and all image directories from prior runs."""
+    """Delete graph_store.json and all image directories from prior runs.
+
+    ``ptdl_store.json`` is intentionally left intact — saved plan memory is
+    long-term and must survive a restart (see ptdl_store.py).
+    """
     import shutil
     graph_json = os.path.join(MEMORY_DIR, "graph_store.json")
     if os.path.exists(graph_json):
         os.remove(graph_json)
         log.info("scribe_mem: cleaned %s", graph_json)
 
-    ptdl_json = os.path.join(MEMORY_DIR, "ptdl_store.json")
-    if os.path.exists(ptdl_json):
-        os.remove(ptdl_json)
-        log.info("scribe_mem: cleaned %s", ptdl_json)
-    # Reset the in-memory singleton so it reloads from scratch
-    try:
-        from .storage.ptdl_store import _ptdl_store_reset
-        _ptdl_store_reset()
-    except Exception:
-        pass
-
-    images_dir = str(Path(__file__).resolve().parent.parent / "data" / "images")
+    images_dir = IMAGES_DIR
     if os.path.isdir(images_dir):
         count = 0
         for entry in os.listdir(images_dir):

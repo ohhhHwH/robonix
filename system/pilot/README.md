@@ -163,3 +163,20 @@ task is advancing while nothing will run, so the reply is rejected
 the turn ends with what the model said. The protocol and the per-round reminder
 state the pairing rule: an empty sequence goes with `task_update: null` or
 `status: "done"`, or stands while a running tree is waited on.
+
+## Exact-query history replay
+
+With `ROBONIX_MEMORY_REPLAY_ENABLED` enabled (the default), an exact query hit
+reconstructs every stored RTDL tree and dispatches it without calling the VLM.
+Trees run in their original numeric `plan_id` order rather than storage order,
+because overlapping trees are persisted when they finish. Historical
+failed/canceled trees are also replayed: they may have produced state needed by
+later recovery trees. A repeated failure from such a tree is allowed to
+continue. A historically successful navigation receives one bounded retry when
+planning, control, or result verification fails; any other new failure stops
+dependent work and reports the Pilot session as failed.
+
+For asynchronous calls, Pilot records the new `run_id` retained in Executor's
+terminal result and binds it into later matching status/cancel calls, replacing
+any stale id saved by an earlier process. Set
+`ROBONIX_MEMORY_REPLAY_ENABLED=0` to force normal VLM planning.

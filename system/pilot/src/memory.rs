@@ -22,6 +22,7 @@ use tonic::Request;
 use uuid::Uuid;
 
 const RTDL_SEQUENCE: u32 = 0;
+const RTDL_PARALLEL: u32 = 1;
 const RTDL_DO: u32 = 2;
 
 fn single_call_plan(
@@ -53,6 +54,99 @@ fn single_call_plan(
         ],
         root_index: 0,
     }
+}
+
+/// Reconstruct a `Plan` proto from the JSON produced by
+/// `planner::plan_to_json` (the saved `rtdl_plan`), assigning a fresh
+/// `plan_id` / `session_id` for the replay dispatch. Best-effort: any parse or
+/// shape mismatch returns `None` so replay falls back to normal planning.
+fn json_to_plan(json: &str, plan_id: String, session_id: String) -> Option<Plan> {
+    let v: serde_json::Value = serde_json::from_str(json).ok()?;
+    let root_index = v.get("root_index")?.as_u64()? as u32;
+    let mut nodes = Vec::new();
+    for node in v.get("nodes")?.as_array()? {
+        let node_kind = match node.get("node_kind")?.as_str()? {
+            "sequence" => RTDL_SEQUENCE,
+            "parallel" => RTDL_PARALLEL,
+            "do" => RTDL_DO,
+            _ => return None,
+        };
+        let children = node
+            .get("children")
+            .and_then(|c| c.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|x| x.as_u64().map(|n| n as u32))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let call = match node.get("call") {
+            Some(serde_json::Value::Object(c)) => {
+                let args_json = c
+                    .get("args")
+                    .map(|args| serde_json::to_string(args).unwrap_or_else(|_| "{}".to_string()))
+                    .unwrap_or_else(|| "{}".to_string());
+                Some(CapabilityCall {
+                    call_id: c
+                        .get("call_id")
+                        .and_then(|x| x.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                    provider_id: c
+                        .get("provider_id")
+                        .and_then(|x| x.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                    contract_id: c
+                        .get("contract_id")
+                        .and_then(|x| x.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                    args_json,
+                })
+            }
+            _ => None,
+        };
+        nodes.push(RtdlNode {
+            node_kind,
+            children,
+            call,
+            op_id: node
+                .get("op_id")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string(),
+            description: node
+                .get("description")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string(),
+        });
+    }
+    Some(Plan {
+        plan_id,
+        session_id,
+        round: 0,
+        nodes,
+        root_index,
+    })
+}
+
+/// Memory-service MCP tools (`ptdl_retrieve`, `ptdl_remember`, …) return their
+/// JSON payload inside a `{"data": "…"}` envelope — the wire form of the
+/// `std_msgs_mcp.String` they hand back to the executor. Unwrap that envelope
+/// (recursively, in case a response is double-wrapped) so callers can read the
+/// real keys (`plans`, `ok`, …) directly. A payload with no `data` key is
+/// returned as-is, so this also works for the older direct-JSON responses.
+fn unwrap_mcp_data(output: &str) -> Option<serde_json::Value> {
+    let mut v: serde_json::Value = serde_json::from_str(output).ok()?;
+    while let Some(data) = v.get("data").and_then(|d| d.as_str()) {
+        match serde_json::from_str::<serde_json::Value>(data) {
+            Ok(inner) => v = inner,
+            Err(_) => break,
+        }
+    }
+    Some(v)
 }
 
 // ── PTDL prefetch ──────────────────────────────────────────────────────────
@@ -106,8 +200,9 @@ pub async fn prefetch(
             if !r.success || r.output.is_empty() {
                 return None;
             }
-            // Parse ptdl_retrieve response: {"plans": [...]}
-            let parsed: serde_json::Value = serde_json::from_str(&r.output).ok()?;
+            // Parse ptdl_retrieve response: {"plans": [...]} (possibly wrapped
+            // in the memory service's `{"data": "…"}` MCP envelope).
+            let parsed = unwrap_mcp_data(&r.output)?;
             let plans = parsed.get("plans")?.as_array()?;
             if plans.is_empty() {
                 return None;
@@ -116,10 +211,7 @@ pub async fn prefetch(
             let mut out = String::from("## Similar successful plans\n\n");
             for (i, p) in plans.iter().enumerate() {
                 let q = p.get("query").and_then(|v| v.as_str()).unwrap_or("?");
-                let d = p
-                    .get("description")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
+                let d = p.get("description").and_then(|v| v.as_str()).unwrap_or("");
                 out.push_str(&format!("**Plan {}:** {}\n", i + 1, q));
                 if !d.is_empty() {
                     out.push_str(&format!("  description: {}\n", d));
@@ -156,6 +248,236 @@ pub async fn prefetch(
     None
 }
 
+#[derive(Debug)]
+pub(crate) struct ReplayPlan {
+    pub(crate) plan: Plan,
+    pub(crate) saved_plan_id: String,
+    pub(crate) expected_success: bool,
+}
+
+#[derive(Debug)]
+struct SavedPlanAst {
+    json: String,
+    saved_plan_id: String,
+    expected_success: bool,
+    stored_index: usize,
+}
+
+/// Collect every stored RTDL tree and restore dispatch order from its original
+/// numeric plan id. Trees are written when they finish, so JSON insertion order
+/// is completion order and is incorrect whenever several trees overlapped.
+fn collect_saved_plans(top: &serde_json::Value) -> Vec<SavedPlanAst> {
+    let mut plans: Vec<SavedPlanAst> = top
+        .get("plans")
+        .and_then(|v| v.as_array())
+        .into_iter()
+        .flatten()
+        .enumerate()
+        .filter_map(|(stored_index, sub)| {
+            let json = sub.get("rtdl_plan")?.as_str()?.trim();
+            if json.is_empty() {
+                return None;
+            }
+            Some(SavedPlanAst {
+                json: json.to_string(),
+                saved_plan_id: sub
+                    .get("plan_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("legacy")
+                    .to_string(),
+                // Unknown/legacy statuses fail closed: only an explicitly
+                // failed or canceled historical tree may fail again without
+                // stopping later dependent work.
+                expected_success: !matches!(
+                    sub.get("status").and_then(|v| v.as_str()),
+                    Some("failed" | "canceled")
+                ),
+                stored_index,
+            })
+        })
+        .collect();
+    plans.sort_by(|left, right| {
+        match (
+            left.saved_plan_id.parse::<u64>(),
+            right.saved_plan_id.parse::<u64>(),
+        ) {
+            (Ok(left_id), Ok(right_id)) => left_id.cmp(&right_id),
+            (Ok(_), Err(_)) => std::cmp::Ordering::Less,
+            (Err(_), Ok(_)) => std::cmp::Ordering::Greater,
+            (Err(_), Err(_)) => left.stored_index.cmp(&right.stored_index),
+        }
+    });
+    plans
+}
+
+/// Attempt a direct replay of previously-saved plans for an *identical*
+/// question. Every child carrying an RTDL tree is reconstructed in original
+/// dispatch order, including failed/canceled children whose side effects or
+/// outputs were prerequisites for later recovery rounds. The caller compares
+/// each new outcome with the historical status so an expected historical
+/// failure can replay through, while a newly-failed successful tree still
+/// stops dependent work.
+///
+/// Returns an empty vec when the store is empty, the question is new, no child
+/// carries an RTDL tree, or replay is disabled; normal planning then resumes.
+///
+/// Gated by `ROBONIX_MEMORY_REPLAY_ENABLED` (default **on**); set to `0` to
+/// force re-planning even when an exact match exists.
+pub async fn try_replay(
+    query: &str,
+    executor: &mut ExecutorConn,
+    target: Option<(String, String)>,
+) -> Vec<ReplayPlan> {
+    if std::env::var("ROBONIX_MEMORY_REPLAY_ENABLED")
+        .map(|v| v == "0")
+        .unwrap_or(false)
+    {
+        return Vec::new();
+    }
+    let Some((provider_id, contract_id)) = target else {
+        return Vec::new();
+    };
+
+    let payload = serde_json::json!({
+        "query": query,
+        "top_k": 1,
+    });
+    let payload_str = serde_json::to_string(&payload).unwrap_or_default();
+
+    let plan = single_call_plan(
+        Uuid::new_v4().to_string(),
+        "memory-replay".to_string(),
+        0,
+        CapabilityCall {
+            call_id: Uuid::new_v4().to_string(),
+            provider_id,
+            contract_id,
+            args_json: serde_json::json!({ "data": payload_str }).to_string(),
+        },
+        "memory_replay",
+    );
+
+    let submitted_plan = plan.clone();
+    let mut stream = match executor.graph.execute(Request::new(plan)).await {
+        Ok(resp) => resp.into_inner(),
+        Err(_) => return Vec::new(),
+    };
+    while let Ok(Some(event)) = stream.message().await {
+        if event.event_kind == RtdlEventEnum::NodeState as u32
+            && let Some(ns) = event.node_state
+            && is_terminal_executor_state(ns.state)
+        {
+            let r = executor_node_state_to_result(&submitted_plan, ns);
+            if !r.success || r.output.is_empty() {
+                return Vec::new();
+            }
+            let Some(parsed) = unwrap_mcp_data(&r.output) else {
+                return Vec::new();
+            };
+            let Some(top) = parsed
+                .get("plans")
+                .and_then(|v| v.as_array())
+                .and_then(|a| a.first())
+            else {
+                return Vec::new();
+            };
+            // Exact-match guard: only an identical question replays directly.
+            if top
+                .get("query")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim()
+                != query.trim()
+            {
+                let _ = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open("/tmp/pilot_ptdl_debug.log")
+                    .and_then(|mut f| {
+                        use std::io::Write;
+                        writeln!(
+                            f,
+                            "REPLAY MISS (not exact): asked={:?} top={:?}",
+                            query.trim(),
+                            top.get("query").and_then(|v| v.as_str()).unwrap_or("")
+                        )
+                    });
+                return Vec::new();
+            }
+
+            let mut saved_plans = collect_saved_plans(top);
+            // Legacy flat record fallback (pre-tree shape).
+            if saved_plans.is_empty()
+                && let Some(ast) = top.get("rtdl_plan").and_then(|v| v.as_str())
+                && !ast.trim().is_empty()
+            {
+                saved_plans.push(SavedPlanAst {
+                    json: ast.to_string(),
+                    saved_plan_id: "legacy".to_string(),
+                    expected_success: true,
+                    stored_index: 0,
+                });
+            }
+            if saved_plans.is_empty() {
+                let _ = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open("/tmp/pilot_ptdl_debug.log")
+                    .and_then(|mut f| {
+                        use std::io::Write;
+                        writeln!(f, "REPLAY MISS (no rtdl_plan): \"{}\"", query.trim())
+                    });
+                return Vec::new();
+            }
+
+            let mut replayed = Vec::with_capacity(saved_plans.len());
+            for saved in saved_plans {
+                match json_to_plan(
+                    &saved.json,
+                    Uuid::new_v4().to_string(),
+                    "memory-replay".to_string(),
+                ) {
+                    Some(plan) => replayed.push(ReplayPlan {
+                        plan,
+                        saved_plan_id: saved.saved_plan_id,
+                        expected_success: saved.expected_success,
+                    }),
+                    None => {
+                        let _ = std::fs::OpenOptions::new()
+                            .create(true)
+                            .append(true)
+                            .open("/tmp/pilot_ptdl_debug.log")
+                            .and_then(|mut f| {
+                                use std::io::Write;
+                                writeln!(f, "REPLAY MISS (json_to_plan failed): {}", saved.json)
+                            });
+                        return Vec::new();
+                    }
+                }
+            }
+            let _ = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open("/tmp/pilot_ptdl_debug.log")
+                .and_then(|mut f| {
+                    use std::io::Write;
+                    writeln!(
+                        f,
+                        "REPLAY HIT: \"{query}\" → {} sub-plan(s), {} nodes total",
+                        replayed.len(),
+                        replayed.iter().map(|p| p.plan.nodes.len()).sum::<usize>()
+                    )
+                });
+            info!(
+                "[pilot] memory replay: exact match \"{query}\" → direct dispatch ({} sub-plan(s))",
+                replayed.len()
+            );
+            return replayed;
+        }
+    }
+    Vec::new()
+}
+
 // ── PTDL save ──────────────────────────────────────────────────────────────
 
 /// Fire-and-forget: save a successful RTDL plan to `ptdl_store.json` via
@@ -181,14 +503,18 @@ pub fn save_plan(
 ) {
     tokio::spawn(async move {
         let _ = std::fs::OpenOptions::new()
-            .create(true).append(true)
+            .create(true)
+            .append(true)
             .open("/tmp/pilot_ptdl_debug.log")
             .and_then(|mut f| {
                 use std::io::Write;
                 writeln!(
                     f,
                     "save_plan ENTERED: \"{q}\" steps={n} trees={t} canceled={c}",
-                    q = user_query, n = steps.len(), t = tree_count, c = canceled_count,
+                    q = user_query,
+                    n = steps.len(),
+                    t = tree_count,
+                    c = canceled_count,
                 )
             });
         let (provider_id, contract_id) = ptdl_target;
@@ -239,28 +565,41 @@ pub fn save_plan(
                         let r = executor_node_state_to_result(&submitted_plan, ns);
                         if r.success {
                             let _ = std::fs::OpenOptions::new()
-                                .create(true).append(true)
+                                .create(true)
+                                .append(true)
                                 .open("/tmp/pilot_ptdl_debug.log")
                                 .and_then(|mut f| {
                                     use std::io::Write;
                                     writeln!(f, "save_plan: OK \"{user_query}\"")
                                 });
-                            info!("[pilot] ptdl save: \"{user_query}\" ({n} steps)", n = steps_text.len());
+                            info!(
+                                "[pilot] ptdl save: \"{user_query}\" ({n} steps)",
+                                n = steps_text.len()
+                            );
                         } else {
                             let _ = std::fs::OpenOptions::new()
-                                .create(true).append(true)
+                                .create(true)
+                                .append(true)
                                 .open("/tmp/pilot_ptdl_debug.log")
                                 .and_then(|mut f| {
                                     use std::io::Write;
-                                    writeln!(f, "save_plan: MEMORY ERROR \"{user_query}\": {}", r.error)
+                                    writeln!(
+                                        f,
+                                        "save_plan: MEMORY ERROR \"{user_query}\": {}",
+                                        r.error
+                                    )
                                 });
-                            warn!("[pilot] ptdl save: \"{user_query}\" memory error: {}", r.error);
+                            warn!(
+                                "[pilot] ptdl save: \"{user_query}\" memory error: {}",
+                                r.error
+                            );
                         }
                         return;
                     }
                 }
                 let _ = std::fs::OpenOptions::new()
-                    .create(true).append(true)
+                    .create(true)
+                    .append(true)
                     .open("/tmp/pilot_ptdl_debug.log")
                     .and_then(|mut f| {
                         use std::io::Write;
@@ -269,7 +608,8 @@ pub fn save_plan(
             }
             Err(status) => {
                 let _ = std::fs::OpenOptions::new()
-                    .create(true).append(true)
+                    .create(true)
+                    .append(true)
                     .open("/tmp/pilot_ptdl_debug.log")
                     .and_then(|mut f| {
                         use std::io::Write;
@@ -284,11 +624,7 @@ pub fn save_plan(
 
 /// Best-effort `compact_memory` on session teardown. Logs failures, never
 /// propagates errors (the provider may be absent entirely).
-pub async fn try_compact(
-    executor: &mut ExecutorConn,
-    atlas: &mut AtlasClient,
-    _consumer_id: &str,
-) {
+pub async fn try_compact(executor: &mut ExecutorConn, atlas: &mut AtlasClient, _consumer_id: &str) {
     let providers = match crate::discovery::discover(atlas).await {
         Ok(c) => c,
         Err(e) => {
@@ -346,12 +682,10 @@ pub async fn try_compact(
 fn is_terminal_executor_state(state: u32) -> bool {
     matches!(
         RtdlNodeStateEnum::try_from(state as i32),
-        Ok(
-            RtdlNodeStateEnum::Succeeded
-                | RtdlNodeStateEnum::Failed
-                | RtdlNodeStateEnum::Canceled
-                | RtdlNodeStateEnum::Timeout
-        )
+        Ok(RtdlNodeStateEnum::Succeeded
+            | RtdlNodeStateEnum::Failed
+            | RtdlNodeStateEnum::Canceled
+            | RtdlNodeStateEnum::Timeout)
     )
 }
 
@@ -378,5 +712,39 @@ fn executor_node_state_to_result(
         } else {
             ns.operator_detail
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::collect_saved_plans;
+    use serde_json::json;
+
+    /// Replay includes failed trees and orders numeric historical ids correctly.
+    #[test]
+    fn replay_collection_includes_failures_and_restores_plan_id_order() {
+        let root = json!({
+            "plans": [
+                {"plan_id":"3", "status":"success", "rtdl_plan":"three"},
+                {"plan_id":"2", "status":"failed", "rtdl_plan":"two"},
+                {"plan_id":"21", "status":"success", "rtdl_plan":"twenty-one"},
+                {"plan_id":"legacy", "status":"canceled", "rtdl_plan":"legacy"},
+                {"plan_id":"unknown", "rtdl_plan":"unknown"}
+            ]
+        });
+
+        let plans = collect_saved_plans(&root);
+
+        assert_eq!(
+            plans
+                .iter()
+                .map(|plan| plan.saved_plan_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["2", "3", "21", "legacy", "unknown"]
+        );
+        assert!(!plans[0].expected_success);
+        assert!(plans[1].expected_success);
+        assert!(!plans[3].expected_success);
+        assert!(plans[4].expected_success);
     }
 }

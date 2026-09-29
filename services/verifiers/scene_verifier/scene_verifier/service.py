@@ -1,4 +1,5 @@
 """Robonix lifecycle entrypoint and request orchestration."""
+import asyncio
 import logging
 
 from .config import VerifierConfig, parse_config
@@ -7,6 +8,45 @@ from .scene_client import fetch_robot_context
 
 VERIFY_CONTRACT = "robonix/service/verifier/verify"
 log = logging.getLogger("scene_verifier")
+
+async def fetch_current_robot_context(
+    consumer_id: str,
+    scene_provider_id: str,
+    timeout_s: float,
+    fetch=fetch_robot_context,
+):
+    """Retry transient unknown/stale Scene snapshots within one timeout budget.
+
+    A navigation result can arrive between odometry updates. Retry only the
+    observation; the final geometric verdict still fails closed if no current
+    pose arrives before the configured deadline.
+    """
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout_s
+    context = None
+    attempt = 0
+    while True:
+        remaining = deadline - loop.time()
+        if remaining <= 0 and context is not None:
+            return context
+        attempt += 1
+        context = await fetch(
+            consumer_id,
+            scene_provider_id,
+            timeout_s if attempt == 1 else max(remaining, 0.001),
+        )
+        if context.pose_known and not context.stale:
+            return context
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            return context
+        log.info(
+            "Scene context is not current (attempt=%d known=%s stale=%s); retrying",
+            attempt,
+            context.pose_known,
+            context.stale,
+        )
+        await asyncio.sleep(min(0.2, remaining))
 
 
 async def verify_request(
@@ -33,10 +73,11 @@ async def verify_request(
             envelope.scene_provider_id,
         )
 
-        context = await fetch(
+        context = await fetch_current_robot_context(
             consumer_id,
             envelope.scene_provider_id,
             config.observation_timeout_s,
+            fetch,
         )
 
         stage = "verify_navigation_result"

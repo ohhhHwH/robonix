@@ -88,9 +88,11 @@ when verification passes.
   verifier relies on Scene's map-frame snapshot convention.
 - Freshness is determined from Scene's `stale` field. Host and simulation clocks
   are not compared.
-- Each request reads one Scene snapshot. The verifier does not retry, wait for
-  further movement, or subscribe to ROS topics.
-- `observation_timeout_s` applies to the asynchronous MCP observation. Executor
+- When Scene reports an unknown or stale robot pose, the verifier retries
+  `get_robot_context` within `observation_timeout_s`; it still fails closed if no
+  current pose arrives. It does not subscribe directly to ROS topics.
+- `observation_timeout_s` is the total retry budget for asynchronous Scene
+  observations. Executor
   applies its own deadline to the complete verification request.
 
 ## Build and test

@@ -398,6 +398,315 @@ async fn drive_plan(
         .await;
 }
 
+/// Return the start contract associated with a status/cancel contract.
+fn async_start_contract(contract_id: &str) -> Option<&str> {
+    contract_id
+        .strip_suffix("/status")
+        .or_else(|| contract_id.strip_suffix("/cancel"))
+}
+
+/// Bind status/cancel `run_id` to the matching start result from this replay.
+/// Historical ids are stale across processes and are replaced when necessary.
+fn bind_replay_run_ids(plan: &mut Plan, run_ids: &HashMap<(String, String), String>) -> usize {
+    let mut bound = 0;
+    for node in &mut plan.nodes {
+        let Some(call) = node.call.as_mut() else {
+            continue;
+        };
+        let Some(start_contract) = async_start_contract(&call.contract_id) else {
+            continue;
+        };
+        let Ok(mut args) = serde_json::from_str::<serde_json::Value>(&call.args_json) else {
+            continue;
+        };
+        let Some(object) = args.as_object_mut() else {
+            continue;
+        };
+        let key = (call.provider_id.clone(), start_contract.to_string());
+        let Some(run_id) = run_ids.get(&key) else {
+            continue;
+        };
+        if object.get("run_id").and_then(|value| value.as_str()) == Some(run_id) {
+            continue;
+        }
+        object.insert(
+            "run_id".to_string(),
+            serde_json::Value::String(run_id.clone()),
+        );
+        call.args_json = args.to_string();
+        bound += 1;
+    }
+    bound
+}
+
+/// Capture newly-created async run ids from terminal start results. Executor
+/// retains the id in both successful and failed terminal outputs so timeout is
+/// still usable by the later historical status/cancel trees.
+fn record_replay_run_ids(
+    results: &[RtdlNodeState],
+    run_ids: &mut HashMap<(String, String), String>,
+) {
+    for result in results
+        .iter()
+        .filter_map(|state| state.leaf_result.as_ref())
+    {
+        if async_start_contract(&result.contract_id).is_some() {
+            continue;
+        }
+        let Ok(output) = serde_json::from_str::<serde_json::Value>(&result.output) else {
+            continue;
+        };
+        let Some(run_id) = output.get("run_id").and_then(|value| value.as_str()) else {
+            continue;
+        };
+        if !run_id.is_empty() {
+            run_ids.insert(
+                (result.provider_id.clone(), result.contract_id.clone()),
+                run_id.to_string(),
+            );
+        }
+    }
+}
+
+/// A historically successful navigation can fail transiently in planning,
+/// control, or result verification. Retry that RTDL tree once; failures in any
+/// other capability still stop dependent replay work.
+fn replay_navigation_failure_is_retryable(results: &[RtdlNodeState]) -> bool {
+    let failed: Vec<&CapabilityCallResult> = results
+        .iter()
+        .filter_map(|state| state.leaf_result.as_ref())
+        .filter(|result| !result.success)
+        .collect();
+    !failed.is_empty()
+        && failed
+            .iter()
+            .all(|result| result.contract_id == "robonix/service/navigation/navigate")
+}
+
+/// Dispatch all stored RTDL trees in original plan-id order without invoking
+/// the VLM. A tree that also failed historically is allowed to finish and feed
+/// its new run id into later recovery/status trees. A historically successful
+/// navigation gets one bounded retry for a transient verification miss; any
+/// other newly failing successful tree stops dependent work.
+async fn run_replay_turn(
+    plans: Vec<memory::ReplayPlan>,
+    executor: &mut ExecutorConn,
+    session_id: &str,
+    tx: &mpsc::Sender<Result<PilotEvent, tonic::Status>>,
+    cancel_rx: &mut watch::Receiver<bool>,
+) -> bool {
+    let _ = tx
+        .send(Ok(service::pack(
+            session_id,
+            PilotStreamBody::TextChunk(
+                "已命中完整历史方案，跳过重新规划，按原始顺序重放执行。".to_string(),
+            ),
+        )))
+        .await;
+
+    let total = plans.len();
+    let mut final_text = String::new();
+    let mut failed = false;
+    let mut run_ids: HashMap<(String, String), String> = HashMap::new();
+    for (index, replay) in plans.into_iter().enumerate() {
+        let mut retry_count = 0;
+        loop {
+            if *cancel_rx.borrow() {
+                final_text = format!("记忆重放已在第 {}/{} 步开始前中断。", index + 1, total,);
+                failed = true;
+                break;
+            }
+            let mut plan = replay.plan.clone();
+            if retry_count > 0 {
+                plan.plan_id = Uuid::new_v4().to_string();
+            }
+            let bound = bind_replay_run_ids(&mut plan, &run_ids);
+            info!(
+                "[pilot] replay {}/{}: saved_plan_id={} expected_success={} bound_run_ids={} retry={}",
+                index + 1,
+                total,
+                replay.saved_plan_id,
+                replay.expected_success,
+                bound,
+                retry_count,
+            );
+            let _ = tx
+                .send(Ok(service::pack(
+                    session_id,
+                    PilotStreamBody::Plan(plan.clone()),
+                )))
+                .await;
+
+            let (forest_tx, mut forest_rx) = mpsc::channel::<ForestEvent>(64);
+            let forest_revision = Arc::new(AtomicU64::new(0));
+            let runtime_plan_id = plan.plan_id.clone();
+            tokio::spawn(drive_plan(
+                plan,
+                executor.graph.clone(),
+                forest_tx,
+                Arc::clone(&forest_revision),
+            ));
+
+            let mut outcome = None;
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = cancel_rx.changed() => {
+                        cancel_executor_plan(executor, &runtime_plan_id).await;
+                        final_text = format!(
+                            "记忆重放已在第 {}/{} 步中断，当前 Executor 计划已取消。",
+                            index + 1,
+                            total,
+                        );
+                        failed = true;
+                        break;
+                    }
+                    event = forest_rx.recv() => {
+                        let Some(event) = event else {
+                            break;
+                        };
+                        match event {
+                            ForestEvent::NodeState {
+                                plan_id,
+                                node_state,
+                            } => {
+                                let mut node_state = *node_state;
+                                node_state.plan_id = plan_id;
+                                let _ = tx
+                                    .send(Ok(service::pack(
+                                        session_id,
+                                        PilotStreamBody::NodeState(node_state),
+                                    )))
+                                    .await;
+                            }
+                            ForestEvent::PlanDone {
+                                plan_id,
+                                results,
+                                any_failed,
+                                canceled,
+                            } => {
+                                outcome = Some((plan_id, results, any_failed, canceled));
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+
+            if failed {
+                break;
+            }
+
+            let Some((plan_id, results, any_failed, canceled)) = outcome else {
+                final_text = format!(
+                    "记忆重放第 {}/{} 步的 Executor 事件流提前结束，已停止后续步骤。",
+                    index + 1,
+                    total,
+                );
+                failed = true;
+                break;
+            };
+            record_replay_run_ids(&results, &mut run_ids);
+            if (any_failed || canceled)
+                && replay.expected_success
+                && retry_count == 0
+                && replay_navigation_failure_is_retryable(&results)
+            {
+                retry_count += 1;
+                warn!(
+                    "[pilot] replay {}/{}: saved_plan_id={} navigation failed; retrying once",
+                    index + 1,
+                    total,
+                    replay.saved_plan_id,
+                );
+                tokio::select! {
+                    biased;
+                    _ = cancel_rx.changed() => {
+                        final_text = format!(
+                            "记忆重放已在第 {}/{} 步重试前中断。",
+                            index + 1,
+                            total,
+                        );
+                        failed = true;
+                    }
+                    _ = tokio::time::sleep(Duration::from_secs(2)) => {}
+                }
+                if failed {
+                    break;
+                }
+                continue;
+            }
+            if any_failed || canceled {
+                if replay.expected_success {
+                    final_text = format!(
+                        "记忆重放第 {}/{} 步出现新失败（历史 plan_id={}，本次 plan_id={}），已停止依赖步骤。",
+                        index + 1,
+                        total,
+                        replay.saved_plan_id,
+                        plan_id,
+                    );
+                    failed = true;
+                } else {
+                    final_text = format!(
+                        "已重放历史未成功步骤 {}/{}（历史 plan_id={}），继续执行其后的恢复步骤。",
+                        index + 1,
+                        total,
+                        replay.saved_plan_id,
+                    );
+                }
+            } else {
+                final_text = format!(
+                    "已按历史方案完成执行（{}/{}，历史 plan_id={}）。",
+                    index + 1,
+                    total,
+                    replay.saved_plan_id,
+                );
+            }
+            break;
+        }
+        if failed {
+            break;
+        }
+    }
+
+    let _ = tx
+        .send(Ok(service::pack(
+            session_id,
+            PilotStreamBody::FinalText(final_text),
+        )))
+        .await;
+    !failed
+}
+
+/// Cancel one Executor plan and wait for its bounded cancellation response.
+/// This prevents a dropped Pilot stream from leaving physical work running.
+async fn cancel_executor_plan(executor: &mut ExecutorConn, target: &str) {
+    let cancel = executor
+        .control
+        .control_plan(Request::new(ControlPlanRequest {
+            action: "cancel".to_string(),
+            plan_id: target.to_string(),
+            op_id: String::new(),
+            when: String::new(),
+            wait_ms: 5_000,
+        }));
+    match tokio::time::timeout(std::time::Duration::from_secs(7), cancel).await {
+        Ok(Ok(response)) => {
+            let response = response.into_inner();
+            if response.success {
+                info!("[pilot] canceled executor plan {target} on abort_turn");
+            } else {
+                warn!(
+                    "[pilot] cancel executor plan {target} rejected: {}",
+                    response.error
+                );
+            }
+        }
+        Ok(Err(error)) => warn!("[pilot] cancel executor plan {target} failed: {error}"),
+        Err(_) => warn!("[pilot] cancel executor plan {target} timed out"),
+    }
+}
+
 /// Cancel every real task tree owned by this turn before reporting the Pilot
 /// session interrupted. Dropping the Execute stream alone only detaches Pilot;
 /// Executor continues the plan (and synchronous tools such as run_command)
@@ -413,32 +722,7 @@ async fn cancel_forest_plans(
         .map(|(plan_id, _)| plan_id.clone())
         .collect();
     for target in targets {
-        let cancel = executor
-            .control
-            .control_plan(Request::new(ControlPlanRequest {
-                action: "cancel".to_string(),
-                plan_id: target.clone(),
-                op_id: String::new(),
-                when: String::new(),
-                wait_ms: 5_000,
-            }));
-        match tokio::time::timeout(std::time::Duration::from_secs(7), cancel).await {
-            Ok(Ok(response)) => {
-                let response = response.into_inner();
-                if response.success {
-                    info!("[pilot] canceled executor plan {target} on abort_turn");
-                } else {
-                    warn!(
-                        "[pilot] cancel executor plan {target} rejected: {}",
-                        response.error
-                    );
-                }
-            }
-            Ok(Err(error)) => {
-                warn!("[pilot] cancel executor plan {target} failed: {error}")
-            }
-            Err(_) => warn!("[pilot] cancel executor plan {target} timed out"),
-        }
+        cancel_executor_plan(executor, &target).await;
     }
 }
 
@@ -1046,8 +1330,8 @@ fn flush_accumulated_plan(
             None,       // rtdl_plan — merged rollup has no single tree AST
             None,       // raw_rtdl — per-round entries carry the raw model output
             n_trees,
-            0,     // canceled_count
-            None,  // plan_id — rollup finalizes the root, adds no child
+            0,    // canceled_count
+            None, // plan_id — rollup finalizes the root, adds no child
         );
     }
 }
@@ -1150,8 +1434,12 @@ pub async fn run_turn(
             use std::io::Write;
             writeln!(
                 f,
-                "DISCOVERY: ptdl_remember={}",
+                "DISCOVERY: ptdl_remember={} ptdl_retrieve={}",
                 remember_memory_target
+                    .as_ref()
+                    .map(|(p, c)| format!("{p}/{c}"))
+                    .unwrap_or_else(|| "NONE".to_string()),
+                search_memory_target
                     .as_ref()
                     .map(|(p, c)| format!("{p}/{c}"))
                     .unwrap_or_else(|| "NONE".to_string()),
@@ -1164,7 +1452,7 @@ pub async fn run_turn(
     let memory_prompt = if skip_memory_prefetch(&task.text) {
         String::new()
     } else {
-        match memory::prefetch(&task.text, executor, search_memory_target).await {
+        match memory::prefetch(&task.text, executor, search_memory_target.clone()).await {
             Some(mem) => format!(
                 "\n\n## Relevant past memories (historical hints only)\n\n\
                  These entries may be stale or task-specific. They are not current robot state, \
@@ -1175,6 +1463,16 @@ pub async fn run_turn(
             ),
             None => String::new(),
         }
+    };
+
+    // 1b2. Direct replay: an identical question with a saved successful plan
+    // dispatches that plan straight to Executor — no VLM re-planning. This is
+    // best-effort: `try_replay` returns None for new questions, failed/canceled
+    // histories, or a missing memory provider, and we fall through to planning.
+    let replay_plans = if skip_memory_prefetch(&task.text) {
+        Vec::new()
+    } else {
+        memory::try_replay(&task.text, executor, search_memory_target).await
     };
 
     // 1c. Append the per-capability docs index. Each provider that registered
@@ -1249,6 +1547,47 @@ pub async fn run_turn(
                 }),
             )))
             .await;
+    }
+
+    // Direct replay short-circuit: dispatch the complete saved execution trace
+    // without invoking the VLM, then report the actual replay outcome.
+    if !replay_plans.is_empty() {
+        info!(
+            "[pilot] direct replay: \"{}\" → saved plan(s), skipping re-planning",
+            task.text
+        );
+        let replay_succeeded =
+            run_replay_turn(replay_plans, executor, &session_id, tx, &mut cancel_rx).await;
+        if let Some(state) = standing_task.as_mut() {
+            if replay_succeeded {
+                state.status = "done".to_string();
+            }
+            let _ = tx
+                .send(Ok(service::pack(
+                    &session_id,
+                    PilotStreamBody::TaskState(TaskStateEvent {
+                        goal: state.goal.clone(),
+                        success_criterion: state.success_criterion.clone(),
+                        status: state.status.clone(),
+                    }),
+                )))
+                .await;
+        }
+        let _ = tx
+            .send(Ok(service::pack(
+                &session_id,
+                PilotStreamBody::Status(SessionStatusEvent {
+                    session_id: session_id.to_string(),
+                    state: if replay_succeeded {
+                        SessionState::Completed as u32
+                    } else {
+                        SessionState::Failed as u32
+                    },
+                    message: String::new(),
+                }),
+            )))
+            .await;
+        return Ok(());
     }
 
     let max_rounds = max_tool_rounds();
@@ -1961,10 +2300,7 @@ pub async fn run_turn(
                 // expands — never on a recovery path, where it could falsely
                 // mark the turn done for a plan that never ran.
                 Ok(graph) => {
-                    raw_rtdl = Some(
-                        serde_json::to_string(&rtdl)
-                            .unwrap_or_else(|_| String::new()),
-                    );
+                    raw_rtdl = Some(serde_json::to_string(&rtdl).unwrap_or_else(|_| String::new()));
                     break (
                         assistant_content,
                         rtdl_description,
@@ -3360,22 +3696,128 @@ mod tests {
     use super::{
         CapabilityPromptCache, CapabilityTargetMap, DEFAULT_SUCCESS_CRITERION, MetaPlanOp, RTDL_DO,
         RTDL_PARALLEL, RTDL_PROTOCOL_REMINDER, RTDL_SEQUENCE, TaskState, TreeMeta, TreeStep,
-        append_steer, apply_task_update, build_capability_target_map, build_display_capabilities,
-        build_executor_active_block, build_forest_block, compact_tool_result,
-        configured_vlm_idle_timeout, duplicate_in_flight_signature, expand_rtdl_to_plan,
-        extract_json_object, feed_results_into_history, format_plan_summary, invalid_cancel_target,
-        is_control_only, is_legacy_plan_control_contract, mixes_control_inspection_with_action,
-        parse_meta_plan_op, parse_rtdl_assistant_response, parse_task_update, plan_call_signatures,
-        plan_to_json, record_dispatched_plan, rtdl_node_kind_name, rtdl_recovery_final_text,
-        rtdl_state_name,
+        append_steer, apply_task_update, async_start_contract, bind_replay_run_ids,
+        build_capability_target_map, build_display_capabilities, build_executor_active_block,
+        build_forest_block, compact_tool_result, configured_vlm_idle_timeout,
+        duplicate_in_flight_signature, expand_rtdl_to_plan, extract_json_object,
+        feed_results_into_history, format_plan_summary, invalid_cancel_target, is_control_only,
+        is_legacy_plan_control_contract, mixes_control_inspection_with_action, parse_meta_plan_op,
+        parse_rtdl_assistant_response, parse_task_update, plan_call_signatures, plan_to_json,
+        record_dispatched_plan, record_replay_run_ids, replay_navigation_failure_is_retryable,
+        rtdl_node_kind_name, rtdl_recovery_final_text, rtdl_state_name,
         should_replan_after_plan_done, skip_memory_prefetch, start_or_resume_task,
         task_is_session_end,
     };
-    use crate::pb::pilot::{CapabilityCall, CapabilityCallResult, Plan, RtdlNode, Task};
+    use crate::pb::pilot::{
+        CapabilityCall, CapabilityCallResult, Plan, RtdlNode, RtdlNodeState, Task,
+    };
     use robonix_atlas::pb as atlas_pb;
     use serde_json::json;
     use std::collections::{HashMap, HashSet};
     use std::time::Duration;
+
+    /// Historical status ids bind to the fresh start id exactly once.
+    #[test]
+    fn replay_binds_new_async_run_id_and_replaces_stale_id() {
+        assert_eq!(
+            async_start_contract("robonix/skill/explore/explore/status"),
+            Some("robonix/skill/explore/explore")
+        );
+        let mut plan = Plan {
+            nodes: vec![RtdlNode {
+                call: Some(CapabilityCall {
+                    provider_id: "explore".into(),
+                    contract_id: "robonix/skill/explore/explore/status".into(),
+                    args_json: r#"{"run_id":"exp-stale"}"#.into(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let run_ids = HashMap::from([(
+            (
+                "explore".to_string(),
+                "robonix/skill/explore/explore".to_string(),
+            ),
+            "exp-new".to_string(),
+        )]);
+
+        assert_eq!(bind_replay_run_ids(&mut plan, &run_ids), 1);
+        let call = plan.nodes[0].call.as_ref().unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&call.args_json).unwrap()["run_id"],
+            "exp-new"
+        );
+        assert_eq!(bind_replay_run_ids(&mut plan, &run_ids), 0);
+    }
+
+    /// A timed-out async start still contributes its fresh id to later trees.
+    #[test]
+    fn replay_records_run_id_from_failed_async_terminal_result() {
+        let results = vec![RtdlNodeState {
+            leaf_result: Some(CapabilityCallResult {
+                provider_id: "explore".into(),
+                contract_id: "robonix/skill/explore/explore".into(),
+                success: false,
+                output: r#"{"run_id":"exp-new","state":"TIMEOUT"}"#.into(),
+                error: "hit ceiling".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }];
+        let mut run_ids = HashMap::new();
+
+        record_replay_run_ids(&results, &mut run_ids);
+
+        assert_eq!(
+            run_ids.get(&(
+                "explore".to_string(),
+                "robonix/skill/explore/explore".to_string(),
+            )),
+            Some(&"exp-new".to_string())
+        );
+    }
+
+    /// Replay retries navigation-only failures but not unrelated capability failures.
+    #[test]
+    fn only_navigation_verification_failure_is_replay_retryable() {
+        let navigation = RtdlNodeState {
+            leaf_result: Some(CapabilityCallResult {
+                contract_id: "robonix/service/navigation/navigate".into(),
+                success: false,
+                error: "result verification failed: position mismatch".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(replay_navigation_failure_is_retryable(
+            std::slice::from_ref(&navigation)
+        ));
+        let provider_failure = RtdlNodeState {
+            leaf_result: Some(CapabilityCallResult {
+                contract_id: "robonix/service/navigation/navigate".into(),
+                success: false,
+                error: "aborted; failed to create plan".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(replay_navigation_failure_is_retryable(&[provider_failure]));
+
+        let command = RtdlNodeState {
+            leaf_result: Some(CapabilityCallResult {
+                contract_id: "robonix/system/executor/builtin/run_command".into(),
+                success: false,
+                error: "command timed out".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(!replay_navigation_failure_is_retryable(&[
+            navigation, command
+        ]));
+    }
 
     #[test]
     fn vlm_idle_timeout_is_bounded_and_has_a_responsive_default() {
@@ -3873,6 +4315,7 @@ mod tests {
         assert!(context.contains("SUCCEEDED"));
     }
 
+    /// Plan serialization preserves operator shape and executable call arguments.
     #[test]
     fn plan_to_json_preserves_operator_tree_and_call_args() {
         let plan = Plan {

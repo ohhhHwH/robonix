@@ -168,6 +168,37 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(passed)
         fetch.assert_awaited_once_with("scene_verifier", "scene", 5.0)
 
+    async def test_retries_stale_context_until_current(self):
+        """A transient stale observation retries until a current pose arrives."""
+        fetch = AsyncMock(side_effect=[
+            replace(context(), stale=True, reason="old odometry"),
+            context(),
+        ])
+        passed, _ = await verify_request(
+            "p:0",
+            json.dumps(payload()),
+            VerifierConfig(observation_timeout_s=1.0),
+            "scene_verifier",
+            fetch,
+        )
+        self.assertTrue(passed)
+        self.assertEqual(fetch.await_count, 2)
+        self.assertEqual(fetch.await_args_list[0].args, ("scene_verifier", "scene", 1.0))
+        self.assertGreater(fetch.await_args_list[1].args[2], 0.0)
+
+    async def test_stale_context_still_fails_after_retry_budget(self):
+        """Repeated stale observations fail closed within the shared budget."""
+        fetch = AsyncMock(return_value=replace(context(), stale=True))
+        passed, detail = await verify_request(
+            "p:0",
+            json.dumps(payload()),
+            VerifierConfig(observation_timeout_s=0.01),
+            "scene_verifier",
+            fetch,
+        )
+        self.assertFalse(passed)
+        self.assertIn("stale", detail)
+
     async def test_invalid_request_does_not_observe(self):
         fetch = AsyncMock()
         with self.assertRaises(ValueError):
@@ -189,8 +220,13 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_output_cannot_override_observation(self):
         fetch = AsyncMock(return_value=replace(context(), stale=True))
-        passed, _ = await verify_request("p:0", json.dumps(payload()),
-                                        VerifierConfig(), "v", fetch)
+        passed, _ = await verify_request(
+            "p:0",
+            json.dumps(payload()),
+            VerifierConfig(observation_timeout_s=0.01),
+            "v",
+            fetch,
+        )
         self.assertFalse(passed)
 
 

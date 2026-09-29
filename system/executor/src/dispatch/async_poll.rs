@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MulanPSL-2.0
 // Poll async MCP capabilities via `<contract_id>/status` until terminal state.
 
-use robonix_scribe::warn;
+use robonix_scribe::{info, warn};
 use std::time::Duration;
 
 use crate::dispatch::{self, async_registry::AsyncGroup};
@@ -31,6 +31,22 @@ pub async fn run_until_terminal(
     }
 
     let run_id = extract_run_id(&initial.output);
+    if !initial_response_accepted(&initial.output) {
+        return (
+            failed_result(call, "async capability rejected the start request"),
+            RtdlNodeStateEnum::Failed as u32,
+        );
+    }
+    if run_id.is_empty() {
+        return (
+            failed_result(call, "async capability accepted without a run_id"),
+            RtdlNodeStateEnum::Failed as u32,
+        );
+    }
+    info!(
+        "[executor] async call_id={} contract='{}' started run_id='{}'",
+        call.call_id, call.contract_id, run_id
+    );
     let accepted = runtime
         .register_or_cancel_async_call(
             &node.plan_id,
@@ -84,7 +100,7 @@ pub async fn run_until_terminal(
 
         let (state, detail) = parse_status_json(&status_out);
         if rtdl_wire::is_terminal_state(state) {
-            let result = terminal_result(call, state, &detail, &status_out);
+            let result = terminal_result(call, state, &detail, &status_out, &run_id);
             runtime
                 .unregister_async_call(&node.plan_id, &call.call_id)
                 .await;
@@ -131,6 +147,19 @@ async fn poll_status(
     } else {
         anyhow::bail!("{}", result.error)
     }
+}
+
+/// Treat an explicit `accepted=false` start response as rejection while
+/// remaining compatible with older async providers that omit the field.
+fn initial_response_accepted(output: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(output)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("accepted")
+                .and_then(|accepted| accepted.as_bool())
+        })
+        .unwrap_or(true)
 }
 
 /// Read `run_id` from the async cap's initial MCP response JSON.
@@ -192,6 +221,7 @@ fn terminal_result(
     state: u32,
     detail: &str,
     raw: &str,
+    run_id: &str,
 ) -> CapabilityCallResult {
     let success = state == RtdlNodeStateEnum::Succeeded as u32;
     CapabilityCallResult {
@@ -199,16 +229,28 @@ fn terminal_result(
         provider_id: call.provider_id.clone(),
         contract_id: call.contract_id.clone(),
         success,
-        output: if success {
-            raw.to_string()
-        } else {
-            String::new()
-        },
+        output: status_with_run_id(raw, run_id),
         error: if success {
             String::new()
         } else {
             detail.to_string()
         },
+    }
+}
+
+/// Keep the run id in the terminal capability result so a caller replaying
+/// later status/cancel trees can bind them to the run started in this process.
+fn status_with_run_id(raw: &str, run_id: &str) -> String {
+    let mut value = serde_json::from_str::<serde_json::Value>(raw)
+        .unwrap_or_else(|_| serde_json::json!({ "detail": raw }));
+    if let Some(object) = value.as_object_mut() {
+        object.insert(
+            "run_id".to_string(),
+            serde_json::Value::String(run_id.to_string()),
+        );
+        value.to_string()
+    } else {
+        serde_json::json!({ "run_id": run_id, "status": value }).to_string()
     }
 }
 
@@ -238,6 +280,21 @@ mod tests {
     fn extract_run_id_from_response() {
         assert_eq!(extract_run_id(r#"{"run_id":"r1","accepted":true}"#), "r1");
         assert_eq!(extract_run_id(r#"{"goal_id":"g1"}"#), "");
+        assert!(initial_response_accepted(
+            r#"{"run_id":"r1","accepted":true}"#
+        ));
+        assert!(!initial_response_accepted(
+            r#"{"run_id":"","accepted":false}"#
+        ));
+    }
+
+    /// Terminal failures retain the fresh id needed by later replay calls.
+    #[test]
+    fn terminal_status_keeps_new_run_id_even_on_timeout() {
+        let output = status_with_run_id(r#"{"state":"TIMEOUT","detail":"hit ceiling"}"#, "exp-new");
+        let parsed: serde_json::Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(parsed["run_id"], "exp-new");
+        assert_eq!(parsed["state"], "TIMEOUT");
     }
 
     #[test]

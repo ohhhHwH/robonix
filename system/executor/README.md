@@ -103,7 +103,9 @@ polls `status` every **2 seconds** until a terminal state (`SUCCEEDED`,
 
 MCP handler requirements for async caps:
 
-- Initial async cap response JSON must include `run_id`.
+- Initial async cap response JSON must include a non-empty `run_id`; an explicit
+  `accepted=false` response or an accepted response without a run id fails the
+  RTDL node before polling.
 - Status cap response JSON must include `state` (`PENDING`, `RUNNING`, `SUCCEEDED`,
   `FAILED`, `CANCELED`, `TIMEOUT`, `PAUSED`); optional `detail` for human-readable text.
   Missing `state` is treated as a failed status response.
@@ -111,6 +113,11 @@ MCP handler requirements for async caps:
   most recent run.
 - Every async cap must register both `<contract_id>/status` and
   `<contract_id>/cancel`. Registering only one is a provider configuration error.
+
+The terminal `CapabilityCallResult.output` retains the new `run_id` together
+with the final status payload, including `FAILED`, `CANCELED`, and `TIMEOUT`
+results. This lets a later RTDL tree bind status/cancel calls to the exact run
+created in the current process.
 
 Sync caps (no `<contract_id>/status` and `<contract_id>/cancel` pair) complete when the initial MCP call
 returns, as before.

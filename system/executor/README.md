@@ -165,7 +165,9 @@ Executor declares builtin MCP capabilities under
 `do` node back to the Executor provider id.
 
 - `read_file`, `write_file`, `patch_file`, `list_dir`, `run_command`: workspace
-  file and shell helpers.
+  file and shell helpers. `run_command` reports a failed capability call when
+  the command exits with a nonzero status and includes its bounded output in
+  the diagnostic.
 - `read_capability_doc`: read a registered provider's documentation so Pilot can
   inspect the abstract interface before use. Args: `provider_id` (required).
   Returns the provider's `CAPABILITY.md` when it registered one, followed by the

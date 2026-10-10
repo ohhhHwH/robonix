@@ -465,6 +465,7 @@ fn terminate_command_group(pgid: u32, signal: nix::sys::signal::Signal) {
     }
 }
 
+/// Format captured output and reject commands that exit unsuccessfully.
 fn format_command_output(out: std::process::Output) -> anyhow::Result<String> {
     let mut result = String::new();
     let stdout = String::from_utf8_lossy(&out.stdout);
@@ -479,8 +480,12 @@ fn format_command_output(out: std::process::Output) -> anyhow::Result<String> {
         result.push_str("stderr: ");
         result.push_str(&truncate(&stderr, 2000));
     }
+    let exit_code = out.status.code().unwrap_or(-1);
+    if !out.status.success() {
+        anyhow::bail!("command exited with code {exit_code}: {result}");
+    }
     if result.is_empty() {
-        result = format!("exit code: {}", out.status.code().unwrap_or(-1));
+        result = format!("exit code: {exit_code}");
     }
     Ok(result)
 }
@@ -488,6 +493,38 @@ fn format_command_output(out: std::process::Output) -> anyhow::Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    fn command_output(code: i32, stdout: &str, stderr: &str) -> std::process::Output {
+        use std::os::unix::process::ExitStatusExt;
+
+        std::process::Output {
+            status: std::process::ExitStatus::from_raw(code << 8),
+            stdout: stdout.as_bytes().to_vec(),
+            stderr: stderr.as_bytes().to_vec(),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn command_output_rejects_nonzero_exit_with_stderr() {
+        let error = format_command_output(command_output(7, "", "step blocked"))
+            .expect_err("nonzero command exit must fail");
+        let message = error.to_string();
+        assert!(message.contains("code 7"), "missing exit code: {message}");
+        assert!(
+            message.contains("step blocked"),
+            "missing stderr: {message}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn command_output_preserves_successful_stdout() {
+        let output = format_command_output(command_output(0, "done\n", ""))
+            .expect("successful command output");
+        assert_eq!(output, "done\n");
+    }
 
     #[test]
     fn a_provider_without_a_manual_still_documents_its_capabilities() {

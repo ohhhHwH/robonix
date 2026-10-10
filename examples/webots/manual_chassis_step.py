@@ -21,6 +21,7 @@ def parse_args() -> argparse.Namespace:
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--forward-m", type=float)
     mode.add_argument("--rotate-deg", type=float)
+    mode.add_argument("--rotate-to-deg", type=float)
     parser.add_argument("--linear-speed", type=float, default=0.25)
     parser.add_argument("--angular-speed", type=float, default=0.5)
     return parser.parse_args()
@@ -140,8 +141,22 @@ def main() -> int:
             result = run_forward(node, publisher, tracker, args.forward_m, args.linear_speed)
             result.update({"status": "done", "mode": "forward_m", "value": args.forward_m})
         else:
-            result = run_rotation(node, publisher, tracker, args.rotate_deg, args.angular_speed)
-            result.update({"status": "done", "mode": "rotate_deg", "value": args.rotate_deg})
+            target_degrees = args.rotate_deg
+            mode = "rotate_deg"
+            if args.rotate_to_deg is not None:
+                target_yaw = math.radians(args.rotate_to_deg)
+                target_degrees = math.degrees(normalize_angle(target_yaw - tracker.yaw))
+                mode = "rotate_to_deg"
+            result = run_rotation(node, publisher, tracker, target_degrees, args.angular_speed)
+            result.update(
+                {
+                    "status": "done",
+                    "mode": mode,
+                    "value": args.rotate_deg
+                    if args.rotate_deg is not None
+                    else args.rotate_to_deg,
+                }
+            )
         print(json.dumps(result))
         return 0
     finally:

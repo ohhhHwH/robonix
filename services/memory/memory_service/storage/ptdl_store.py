@@ -256,6 +256,29 @@ class PtdlStore:
             return [exact] + rest
         return self._fuzzy_search(query, self._entries, top_k)
 
+    def search_by_time(
+        self,
+        start_ts: int = 0,
+        end_ts: int = 0,
+        top_k: int = 0,
+    ) -> List[Dict[str, Any]]:
+        """Return task records whose ``timestamp_ns`` falls in
+        ``[start_ts, end_ts]``, most-recent-first.
+
+        ``end_ts=0`` means no upper bound (the current time).  ``top_k=0``
+        returns every match.
+        """
+        if end_ts <= 0:
+            end_ts = time.time_ns()
+        matched = [
+            e for e in self._entries
+            if start_ts <= int(e.get("timestamp_ns") or 0) <= end_ts
+        ]
+        matched.sort(key=lambda e: int(e.get("timestamp_ns") or 0), reverse=True)
+        if top_k and top_k > 0:
+            matched = matched[:top_k]
+        return matched
+
     def _fuzzy_search(
         self, query: str, entries: List[Dict[str, Any]], top_k: int
     ) -> List[Dict[str, Any]]:

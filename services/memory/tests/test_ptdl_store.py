@@ -145,3 +145,27 @@ def test_different_queries_stay_separate(tmp_path):
     store.add("去厨房拿可乐", "", ["1. [nav] go"], plan_id="1")
     store.add("去办公室关电脑", "", ["1. [nav] go"], plan_id="1")
     assert store.count() == 2
+
+
+def test_search_by_time_filters_and_sorts_desc(tmp_path):
+    store = _store(tmp_path)
+    store.add("任务A", "", ["1. [nav] go"], plan_id="1")
+    store.add("任务B", "", ["1. [nav] go"], plan_id="1")
+    store.add("任务C", "", ["1. [nav] go"], plan_id="1")
+
+    # Pin deterministic timestamps (ns) — A oldest, C newest.
+    store._entries[0]["timestamp_ns"] = 1_000_000_000
+    store._entries[1]["timestamp_ns"] = 2_000_000_000
+    store._entries[2]["timestamp_ns"] = 3_000_000_000
+
+    # Whole window → newest first.
+    hits = store.search_by_time(start_ts=0, end_ts=3_000_000_000)
+    assert [e["query"] for e in hits] == ["任务C", "任务B", "任务A"]
+
+    # Narrow window → only the middle record.
+    hits = store.search_by_time(start_ts=1_500_000_000, end_ts=2_500_000_000)
+    assert [e["query"] for e in hits] == ["任务B"]
+
+    # start beyond every record → empty.
+    assert store.search_by_time(start_ts=4_000_000_000) == []
+

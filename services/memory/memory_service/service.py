@@ -333,6 +333,36 @@ if _MCP_AVAILABLE:
                         ctx, len(data), e)
             return None
 
+    def _relative_window_ns(relative: str) -> tuple:
+        """Translate a relative-time keyword into a ``(start_ts, end_ts)``
+        nanosecond window aligned to local calendar boundaries.
+
+        Consistent with ``time.time_ns()`` (UTC epoch ns), so it filters the
+        ``timestamp_ns`` values written by ptdl_store.  Supports the English
+        keywords the VLM is told to use plus the common Chinese equivalents.
+        """
+        import datetime
+        now = datetime.datetime.now()
+        today_start = datetime.datetime.combine(now.date(), datetime.time.min)
+        rel = (relative or "").strip().lower()
+        if rel in ("today", "今天", "今日"):
+            start, end = today_start, now
+        elif rel in ("yesterday", "昨天", "昨日"):
+            start = today_start - datetime.timedelta(days=1)
+            end = today_start
+        elif rel in ("last_week", "last week", "past_week", "上周"):
+            start = now - datetime.timedelta(days=7)
+            end = now
+        elif rel in ("last_month", "last month", "上月"):
+            start = now - datetime.timedelta(days=30)
+            end = now
+        else:
+            raise ValueError(
+                f"unsupported relative_time: {relative!r} "
+                "(use today / yesterday / last_week)"
+            )
+        return int(start.timestamp() * 1e9), int(end.timestamp() * 1e9)
+
     # ── MCP tool handlers ──────────────────────────────────────────────
 
     @_memory_svc.mcp("robonix/service/memory/remember")
@@ -710,6 +740,91 @@ if _MCP_AVAILABLE:
         plans = ptdl.search(query=query, top_k=top_k)
         log.info("API ptdl_retrieve: \"%s\" → %d plans", query[:80], len(plans))
         return _json_ok({"plans": plans})
+
+    @_memory_svc.mcp("robonix/service/memory/search_history")
+    async def _mcp_search_history(msg: String) -> String:
+        """Search the robot's task history by time — answer questions like
+        "我昨天/今天/上周做过什么任务？" (what tasks did I do …).
+
+        Reads the standalone plan store (ptdl_store.json), where each record
+        is one user task (its ``query``) saved with a ``timestamp_ns``.
+        Returns a summary list (query / description / timestamp_ns /
+        plan_count / canceled_count), most-recent-first.  It does NOT search
+        the observation CKG graph.
+
+        Time window — give exactly one of:
+        - ``relative_time``: "today" | "yesterday" | "last_week" (also
+          accepts "last_month").  Preferred: the server converts the keyword
+          to a nanosecond window for you.  Map the user's words directly:
+          "今天" → "today", "昨天" → "yesterday", "上周/最近一周" → "last_week".
+        - ``time_range``: {"start_ts": <ns>, "end_ts": <ns>} — explicit
+          nanosecond window; ``end_ts`` 0 means "until now".  Used only when
+          you already have concrete epoch-ns timestamps.
+
+        Request JSON schema (both time fields optional — omit both to list
+        all tasks):
+        {
+          "relative_time": "yesterday"
+          // or: "time_range": {"start_ts": 1792389000000000000, "end_ts": 0}
+        }
+
+        Response JSON:
+        {
+          "tasks": [
+            {
+              "query": "去厨房拿水杯",
+              "description": "navigate→grasp→return",
+              "timestamp_ns": 1792389521574177139,
+              "plan_count": 18,
+              "canceled_count": 0
+            }
+          ]
+        }
+        On error: {"error": "<description>"}
+        """
+        req_dict = _parse_json(msg.data, ctx="search_history")
+        if req_dict is None:
+            return _json_error("Invalid JSON in request body", ctx="search_history")
+
+        start_ts = 0
+        end_ts = 0
+        tr = req_dict.get("time_range")
+        rel = req_dict.get("relative_time")
+        # The VLM sometimes puts the relative keyword inside ``time_range``
+        # (e.g. {"time_range": "yesterday"}) instead of ``relative_time``.
+        # Treat a bare string there as a relative keyword too.
+        if isinstance(tr, str) and tr.strip():
+            rel = tr
+            tr = None
+        if isinstance(tr, dict):
+            try:
+                start_ts = int(tr.get("start_ts", 0))
+                end_ts = int(tr.get("end_ts", 0))
+            except (TypeError, ValueError) as e:
+                return _json_error(f"Invalid time_range: {e}", ctx="search_history")
+        elif rel:
+            try:
+                start_ts, end_ts = _relative_window_ns(str(rel))
+            except ValueError as e:
+                return _json_error(str(e), ctx="search_history")
+
+        from .storage.ptdl_store import get_ptdl_store
+        ptdl = get_ptdl_store()
+        entries = ptdl.search_by_time(start_ts=start_ts, end_ts=end_ts)
+
+        tasks = [
+            {
+                "query": e.get("query", ""),
+                "description": e.get("description", ""),
+                "timestamp_ns": int(e.get("timestamp_ns") or 0),
+                "plan_count": int(e.get("plan_count") or 0),
+                "canceled_count": int(e.get("canceled_count") or 0),
+            }
+            for e in entries
+        ]
+        log.info("API search_history: window=[%d, %d] → %d tasks",
+                 start_ts, end_ts, len(tasks))
+        return _json_ok({"tasks": tasks})
 
     @_memory_svc.on_init
     def _on_init(cfg):

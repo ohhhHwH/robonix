@@ -44,6 +44,9 @@ exec docker exec \
   bash -lc 'set -eo pipefail
             set +u
             source /opt/ros/humble/setup.bash >/dev/null
+            export PYTHONPATH="/robonix_pkgs/pylib/robonix-api:$PYTHONPATH"
+            OVL=/robonix_pkgs/primitives/tiago_chassis/rbnx-build/codegen/ros2_idl/install/setup.bash
+            [ -f "$OVL" ] && source "$OVL" >/dev/null || true
             cd /robonix_pkgs/primitives/tiago_chassis
             LOG=/tmp/tiago_chassis_driver.log
             : > "$LOG"

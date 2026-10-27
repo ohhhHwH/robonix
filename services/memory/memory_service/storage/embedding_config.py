@@ -23,14 +23,20 @@ from typing import Any, Dict, List, Optional
 
 @dataclass
 class EmbeddingModelConfig:
-    """Configuration for the text embedding model. (§2.7.1)"""
+    """Configuration for the text embedding model. (§2.7.1)
 
-    model_name: str = "all-MiniLM-L6-v2"
+    BGE-M3 (``BAAI/bge-m3``, ONNX int8 ``gpahal/bge-m3-onnx-int8``) replaces
+    the English-only MiniLM model; it emits 1024-dim bilingual dense vectors.
+    ``model_path`` stays for a pre-downloaded ONNX directory; ``model_name``
+    is passed to Hugging Face Hub when no local path is configured.
+    """
+
+    model_name: str = "gpahal/bge-m3-onnx-int8"
     model_path: str = ""              # resolved at __post_init__
-    dim: int = 384
+    dim: int = 1024
     batch_size: int = 32
     device: str = "cpu"
-    max_seq_length: int = 256
+    max_seq_length: int = 8192
 
     def __post_init__(self):
         if not self.model_path:
@@ -38,7 +44,7 @@ class EmbeddingModelConfig:
         self.model_path = os.path.expanduser(self.model_path)
 
 
-def _hash_embedding(text: str, dim: int = 384) -> List[float]:
+def _hash_embedding(text: str, dim: int = 1024) -> List[float]:
     """Deterministic pseudo-embedding from text hash.
 
     Produces a unit-norm vector of `dim` floats from the SHA-256 of `text`.

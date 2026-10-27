@@ -1,12 +1,17 @@
-"""Image Store — local image persistence under data/images/{node_id}/.
+"""Image Store — observation frames stored in MongoDB (BSON Binary) with a
+local file-system fallback.
 
-Each MemoryNode's observation frames are stored as JPEG files in a
-per-node subdirectory (named ``frame_0001.jpg``).  ``list()`` accepts
-both ``.jpg`` and ``.png`` for backward compatibility.  Paths returned
-are relative to the service package root (``services/memory/``).
+When a ``MongoBackend`` is available, frames are appended to the owning
+node's ``images`` Binary array and ``list()`` returns opaque markers
+(``mongo:{node_id}:{index}``) that stay lazy — the bytes are loaded only on
+demand via ``read_bytes_by_ref`` (VLM QA path).  When Mongo is absent the
+store falls back to ``data/images/{node_id}/frame_XXXX.jpg`` exactly as
+before.
 
-Per-node limit: ``MAX_IMAGES_PER_NODE`` (default 10).  When the limit
-is reached, the oldest image is evicted before saving a new one.
+Per-node limit: ``MAX_IMAGES_PER_NODE`` (default 10).  When the limit is
+reached, the oldest image is evicted before saving a new one (Mongo
+``$pop -1``, disk oldest-file unlink).  ``list()`` always regenerates
+markers from the current count, so eviction never leaves stale indices.
 
 Orphan GC: ``gc_orphans()`` scans ``data/images/`` and removes
 subdirectories whose ``node_id`` is no longer in the graph.
@@ -19,6 +24,8 @@ import os
 from pathlib import Path
 from typing import List, Optional, Set
 
+from .mongo_backend import _mongo_image_marker
+
 log = logging.getLogger("scribe_mem")
 
 _DEFAULT_IMAGE_ROOT = str(
@@ -30,31 +37,41 @@ _MAX_IMAGES_PER_NODE = int(os.environ.get("MAX_IMAGES_PER_NODE", "10"))
 
 
 class ImageStore:
-    """Local file-system store for observation images.
+    """Store for observation images (Mongo Binary, disk fallback)."""
 
-    Layout:
-        {image_root}/
-          {node_id}/
-            frame_0001.png
-            frame_0002.png
-            ...
-    """
-
-    def __init__(self, image_root: str = ""):
+    def __init__(self, image_root: str = "", *, mongo=None):
         self._root = Path(image_root or _DEFAULT_IMAGE_ROOT)
+        self._mongo = mongo
 
     @property
     def root(self) -> str:
         return str(self._root)
 
+    @property
+    def _mongo_ready(self) -> bool:
+        return self._mongo is not None and self._mongo.available
+
     # ── Write ──────────────────────────────────────────────────────────
 
     def save(self, node_id: int, image_bytes: bytes) -> str:
-        """Save one image frame for a node.  Returns the relative path.
+        """Save one image frame for a node.  Returns the ref (marker or path).
 
         When the per-node image limit (``MAX_IMAGES_PER_NODE``) is
         reached, the oldest frame is evicted first.
         """
+        if self._mongo_ready:
+            if self._mongo.image_count(node_id) >= _MAX_IMAGES_PER_NODE:
+                self._mongo.pop_oldest_image(node_id)
+                log.debug("image_store: evicted oldest Mongo frame (node %d at limit %d)",
+                          node_id, _MAX_IMAGES_PER_NODE)
+            count = self._mongo.push_image(node_id, image_bytes)
+            if count > 0:
+                ref = _mongo_image_marker(node_id, count - 1)
+                log.info("image_store: wrote %s (%.1f KB)",
+                         ref, len(image_bytes) / 1024)
+                return ref
+            # Node doc missing in Mongo — fall through to disk.
+
         node_dir = self._node_dir(node_id)
         node_dir.mkdir(parents=True, exist_ok=True)
 
@@ -92,10 +109,26 @@ class ImageStore:
     # ── Read ───────────────────────────────────────────────────────────
 
     def list(self, node_id: int) -> List[str]:
-        """Return relative paths of all images for a node, sorted by name."""
+        """Return refs of all images for a node, sorted by insertion order."""
+        if self._mongo_ready:
+            n = self._mongo.image_count(node_id)
+            if n > 0:
+                return [_mongo_image_marker(node_id, i) for i in range(n)]
         node_dir = self._node_dir(node_id)
         files = _list_image_files(node_dir)
         return [str(f.relative_to(self._root.parent.parent)) for f in files]
+
+    def read_bytes_by_ref(self, ref: str) -> Optional[bytes]:
+        """Resolve a ref (``mongo:{node_id}:{index}``) to raw bytes, or None."""
+        if ref.startswith("mongo:") and self._mongo_ready:
+            try:
+                _, nid_str, idx_str = ref.split(":")
+                nid, idx = int(nid_str), int(idx_str)
+                imgs = self._mongo.get_images(nid)
+                return imgs[idx] if 0 <= idx < len(imgs) else None
+            except (ValueError, IndexError):
+                return None
+        return None
 
     def get_node_dir(self, node_id: int) -> str:
         """Return the absolute path to a node's image directory."""
@@ -103,17 +136,24 @@ class ImageStore:
 
     def count(self, node_id: int) -> int:
         """Number of images stored for a node."""
+        if self._mongo_ready:
+            return self._mongo.image_count(node_id)
         return len(self.list(node_id))
 
     def remove(self, node_id: int) -> bool:
         """Delete all images for a node.  Returns True if anything was deleted."""
+        removed = False
+        if self._mongo_ready:
+            if self._mongo.image_count(node_id) > 0:
+                self._mongo.clear_images(node_id)
+                removed = True
         node_dir = self._node_dir(node_id)
-        if not node_dir.exists():
-            return False
-        import shutil
-        shutil.rmtree(str(node_dir), ignore_errors=True)
+        if node_dir.exists():
+            import shutil
+            shutil.rmtree(str(node_dir), ignore_errors=True)
+            removed = True
         log.debug("image_store: removed images for node %d", node_id)
-        return True
+        return removed
 
     # ── GC ─────────────────────────────────────────────────────────────
 

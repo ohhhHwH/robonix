@@ -27,78 +27,35 @@ log = logging.getLogger("scribe_mem")
 # ── Text Embedder ──────────────────────────────────────────────────────
 
 class TextEmbedder:
-    """Text → vector encoder.
+    """Text → vector encoder, backed by BGE-M3 (ONNX) via ``BgeEmbedder``.
 
-    Phase1: tries sentence-transformers, falls back to deterministic hash.
+    Phase1 dropped sentence-transformers; the memory service now shares one
+    BGE-M3 embedder with Milvus (design doc §4.1).  ``BgeEmbedder`` falls
+    back to deterministic hash when onnxruntime / the model is missing.
     """
 
     def __init__(self, config: EmbeddingModelConfig):
-        self._config = config
-        self._model: Any = None
-        self._initialized = False
-        self._try_load_model()
+        from .bge_embedder import BgeEmbedder
 
-    def _try_load_model(self) -> None:
-        """Attempt to load all-MiniLM-L6-v2 from the local path or via package."""
-        model_path = self._config.model_path
-        try:
-            from sentence_transformers import SentenceTransformer
-            if model_path and os.path.isdir(model_path):
-                self._model = SentenceTransformer(model_path, device=self._config.device)
-                log.info("TextEmbedder: loaded embedding model from %s", model_path)
-                self._initialized = True
-            else:
-                if model_path:
-                    log.warning(
-                        "TextEmbedder: configured model path not found (%s); "
-                        "trying model name %s through the standard cache",
-                        model_path,
-                        self._config.model_name,
-                    )
-                self._model = SentenceTransformer(
-                    self._config.model_name,
-                    device=self._config.device,
-                )
-                log.info(
-                    "TextEmbedder: loaded %s through the standard cache",
-                    self._config.model_name,
-                )
-                self._initialized = True
-        except ImportError:
-            log.warning(
-                "TextEmbedder: sentence-transformers not installed, "
-                "falling back to deterministic hash embedding (non-semantic)"
-            )
-        except Exception as e:
-            log.warning(
-                "TextEmbedder: failed to load model (%s), "
-                "falling back to deterministic hash embedding", e
-            )
+        self._config = config
+        self._embedder = BgeEmbedder(config)
 
     @property
     def dim(self) -> int:
-        return self._config.dim
+        return self._embedder.dim
 
     @property
     def is_semantic(self) -> bool:
-        """True if using a real embedding model (vs. hash fallback)."""
-        return self._initialized
+        """True if the real BGE-M3 model is loaded (vs. hash fallback)."""
+        return self._embedder.is_semantic
 
     def encode(self, text: str) -> List[float]:
         """Encode a single text to a vector."""
-        if self._initialized and self._model is not None:
-            result = self._model.encode([text], batch_size=1, show_progress_bar=False)
-            # result is a numpy array of shape (1, dim)
-            return result[0].tolist()
-        return _hash_embedding(text, dim=self._config.dim)
+        return self._embedder.encode(text)
 
     def encode_batch(self, texts: List[str]) -> List[List[float]]:
         """Encode multiple texts."""
-        if self._initialized and self._model is not None:
-            results = self._model.encode(texts, batch_size=self._config.batch_size,
-                                         show_progress_bar=False)
-            return [r.tolist() for r in results]
-        return [_hash_embedding(t, dim=self._config.dim) for t in texts]
+        return self._embedder.encode_batch(texts)
 
 
 # ── BM25 Index ─────────────────────────────────────────────────────────
@@ -240,12 +197,17 @@ class VectorStore:
     """
 
     def __init__(self, config: Optional[EmbeddingModelConfig] = None, alpha: float = 0.3,
-                 *, embedding_enabled: bool = True):
+                 *, embedding_enabled: bool = True, embedder=None):
         self._config = config or EmbeddingModelConfig()
         self._alpha = alpha
         self._embedding_enabled = embedding_enabled
-        self._embedder: Optional[TextEmbedder] = None
-        if embedding_enabled:
+        # ``embedder`` is a shared BgeEmbedder (or TextEmbedder) injected by
+        # service.py so the dense vectors used by Milvus and this store are the
+        # same BGE-M3 embeddings — one model load instead of two.
+        self._embedder: Optional[Any] = None
+        if embedder is not None:
+            self._embedder = embedder
+        elif embedding_enabled:
             self._embedder = TextEmbedder(self._config)
         self._bm25 = BM25Index()
 

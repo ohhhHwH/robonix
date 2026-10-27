@@ -1,6 +1,11 @@
-"""Graph Store — in-memory dict + JSON file persistence for MemoryNode.
+"""Graph Store — in-memory dict + MongoDB persistence for MemoryNode.
 
-Phase1 implementation: Python dict with JSON file backup.
+MongoDB (``scene_nodes`` / ``causal_edges``) is the authoritative store when
+available; the JSON file is kept as a graceful-degradation fallback (and a
+one-time backfill source).  The derived Milvus vector index is synced on the
+same write path ("先 Mongo 后 Milvus", design doc §5.1): every add/update/
+promote upserts a ``memory_vectors`` row keyed by ``doc_id=str(node_id)``.
+
 Interface is designed so a NetworkX / Neo4j backend can be swapped in later.
 """
 
@@ -8,6 +13,7 @@ from __future__ import annotations
 
 import functools
 import json
+import logging
 import os
 import threading
 import time
@@ -15,6 +21,8 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from ..core.types import CausalRelation, CausalEdge, MemoryNode, NodeType
+
+log = logging.getLogger("scribe_mem")
 
 
 def _locked(method):
@@ -25,22 +33,33 @@ def _locked(method):
     return wrapper
 
 
+def _scene_embed_text(node: MemoryNode) -> str:
+    """Bilingual embed text for a scene node (design doc §4)."""
+    zh = (node.summary_zh or "").strip()
+    en = (node.summary_en or "").strip()
+    if zh and en:
+        return f"{zh} / {en}"
+    return node.summary or zh or en
+
+
 class GraphStore:
     """Persistent store for MemoryNode and causal edges.
-
-    Phase1: dict-based adjacency list + JSON file persistence.
 
     The scene hook writes from its own thread while MCP tools write from the
     event loop, so every public method holds one reentrant lock. Unlocked,
     two writers race on the shared graph_store.json.tmp and one os.replace
     finds its file already moved.
+
+    ``mongo`` / ``milvus`` / ``embedder`` are optional backends injected by
+    ``service.py``; when absent the store degrades to JSON-only with no
+    vector index (``None`` → no-op).
     """
 
-    # Phase1: local directory under CWD (matches service MEMORY_DIR default).
+    # Local directory under CWD (matches service MEMORY_DIR default).
     # When run via rbnx boot, CWD = services/memory/ → data at ./memory/
     DEFAULT_DATA_DIR = os.path.join(os.getcwd(), "memory")
 
-    def __init__(self, data_dir: str = ""):
+    def __init__(self, data_dir: str = "", *, mongo=None, milvus=None, embedder=None):
         self._data_dir = Path(data_dir or self.DEFAULT_DATA_DIR)
         self._data_dir.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
@@ -50,8 +69,13 @@ class GraphStore:
         self._children: Dict[int, Set[int]] = {}
         # reverse: node_id -> set of parent node_ids
         self._parents: Dict[int, Set[int]] = {}
-        self._next_short_term_id: int = 0
-        self._next_long_term_id: int = 1000
+        # Single monotonic counter. node_type is the sole long/short-term
+        # discriminator; IDs carry no range semantics (stable across promote).
+        self._next_id: int = 0
+
+        self._mongo = mongo
+        self._milvus = milvus
+        self._embedder = embedder
 
         self._load()
 
@@ -64,13 +88,10 @@ class GraphStore:
         Returns the assigned node_id.
         """
         if node.node_id <= 0:
-            node.node_id = self._next_id()
+            node.node_id = self._next_node_id()
         else:
             # Ensure counter stays ahead of explicit IDs
-            if node.node_id < 1000:
-                self._next_short_term_id = max(self._next_short_term_id, node.node_id + 1)
-            else:
-                self._next_long_term_id = max(self._next_long_term_id, node.node_id + 1)
+            self._next_id = max(self._next_id, node.node_id + 1)
 
         if node.created_at == 0:
             node.created_at = time.time_ns()
@@ -82,6 +103,7 @@ class GraphStore:
             self._parents[node.node_id] = set()
 
         self._persist()
+        self._sync_milvus_upsert(node)
         return node.node_id
 
     @_locked
@@ -111,6 +133,7 @@ class GraphStore:
         node.version += 1
         self._nodes[node_id] = node
         self._persist()
+        self._sync_milvus_upsert(node)
 
     @_locked
     def list_by_type(self, node_type: NodeType, limit: int = 100) -> List[MemoryNode]:
@@ -145,17 +168,25 @@ class GraphStore:
         del self._nodes[node_id]
         self._children.pop(node_id, None)
         self._parents.pop(node_id, None)
+        if self._mongo is not None:
+            self._mongo.delete_node(node_id)
+            self._mongo.delete_edges_for(node_id)
         self._persist()
+        self._sync_milvus_delete(node_id)
         return True
 
     @_locked
     def clear_all(self) -> None:
-        """Remove all nodes, edges, and reset ID counters."""
+        """Remove all nodes, edges, and reset the ID counter."""
         self._nodes.clear()
         self._children.clear()
         self._parents.clear()
-        self._next_short_term_id = 0
-        self._next_long_term_id = 1000
+        self._next_id = 0
+        if self._mongo is not None:
+            self._mongo.clear_scene()
+            self._mongo.clear_edges()
+        if self._milvus is not None:
+            self._milvus.clear_kind("scene")
         self._persist()
 
     @_locked
@@ -211,70 +242,90 @@ class GraphStore:
 
     # ── Internal ───────────────────────────────────────────────────────
 
-    def _next_id(self) -> int:
-        """Auto-increment ID: 0-999 short-term, 1000+ long-term."""
-        if self._next_short_term_id <= 999:
-            nid = self._next_short_term_id
-            self._next_short_term_id += 1
-            return nid
-        nid = self._next_long_term_id
-        self._next_long_term_id += 1
+    def _next_node_id(self) -> int:
+        """Auto-increment monotonic ID (no long/short range semantics)."""
+        nid = self._next_id
+        self._next_id += 1
         return nid
 
     @_locked
     def promote_to_long_term(self, node_id: int) -> Optional[int]:
-        """Move a short-term node (0-999) to the long-term range (1000+).
+        """Mark a short-term node long-term, keeping its stable ``node_id``.
 
-        Returns the new node_id, or None if already long-term.
+        Returns the node_id, or None if not found / already long-term.
+        ``node_type`` is the sole long/short discriminator now, so promote
+        does not renumber — it flips the flag and re-syncs Milvus so the
+        ``node_type`` scalar filter stops missing the freshly-promoted node.
         """
         node = self._nodes.get(node_id)
-        if node is None or node.node_id >= 1000:
+        if node is None or node.node_type == NodeType.LONG_TERM:
             return None
 
-        new_id = self._next_long_term_id
-        self._next_long_term_id += 1
-
-        # Remap edges
-        old_parents = list(self._parents.get(node_id, set()))
-        old_children = list(self._children.get(node_id, set()))
-
-        self.remove_node(node_id)
-
-        node.node_id = new_id
         node.node_type = NodeType.LONG_TERM
-        self._nodes[new_id] = node
-        self._children[new_id] = set()
-        self._parents[new_id] = set()
-
-        for pid in old_parents:
-            self._children.setdefault(pid, set()).add(new_id)
-            self._parents[new_id].add(pid)
-        for cid in old_children:
-            self._parents.setdefault(cid, set()).add(new_id)
-            self._children[new_id].add(cid)
-            # Rewrite causal_chain in each child node so the serialised
-            # copy stays consistent with the in-memory adjacency sets.
-            child = self._nodes.get(cid)
-            if child is not None and node_id in child.causal_chain:
-                child.causal_chain = [
-                    new_id if p == node_id else p
-                    for p in child.causal_chain
-                ]
-
+        node.version += 1
         self._persist()
-        return new_id
+        self._sync_milvus_upsert(node)
+        return node_id
+
+    def _milvus_vector(self, node: MemoryNode) -> List[float]:
+        """Return the cached vector, computing + caching it when empty."""
+        if node.embedding:
+            return list(node.embedding)
+        if self._embedder is None:
+            return []
+        try:
+            vec = self._embedder.encode(_scene_embed_text(node))
+            node.embedding = vec
+            return vec
+        except Exception as e:  # noqa: BLE001 — vector index is best-effort
+            log.warning("graph_store: embed for node %d failed: %s", node.node_id, e)
+            return []
+
+    def _sync_milvus_upsert(self, node: MemoryNode) -> None:
+        if self._milvus is None or not self._milvus.available:
+            return
+        vec = self._milvus_vector(node)
+        if not vec:
+            return
+        self._milvus.upsert(
+            str(node.node_id),
+            vec,
+            kind="scene",
+            node_type=node.node_type.value,
+            timestamp=node.timestamp,
+        )
+
+    def _sync_milvus_delete(self, node_id: int) -> None:
+        if self._milvus is not None and self._milvus.available:
+            self._milvus.delete(str(node_id))
+
+    @_locked
+    def rebuild_milvus(self) -> int:
+        """Re-upsert every node into Milvus (on_init rebuild from Mongo).
+
+        Nodes loaded from Mongo carry no cached vector (Mongo stores none),
+        so ``_sync_milvus_upsert`` re-embeds each one via the BGE embedder.
+        """
+        if self._milvus is None or not self._milvus.available:
+            return 0
+        for node in self._nodes.values():
+            self._sync_milvus_upsert(node)
+        return len(self._nodes)
 
     def _persist(self) -> None:
-        """Flush nodes and edges to a JSON file."""
-        nodes_data = [n.to_dict() for n in self._nodes.values()]
+        """Flush nodes and edges to the JSON fallback + MongoDB."""
+        nodes_data = []
+        for n in self._nodes.values():
+            d = n.to_dict()
+            d.pop("embedding", None)  # vector is derived → lives only in Milvus
+            nodes_data.append(d)
         edges_data = []
         for parent_id, children in self._children.items():
             for child_id in children:
                 edges_data.append({"from": parent_id, "to": child_id})
 
         payload = {
-            "next_short_id": self._next_short_term_id,
-            "next_long_id": self._next_long_term_id,
+            "next_id": self._next_id,
             "nodes": nodes_data,
             "edges": edges_data,
         }
@@ -284,24 +335,51 @@ class GraphStore:
             json.dump(payload, f, indent=2)
         os.replace(tmp, str(filepath))
 
+        # Mongo (authoritative) — only metadata, never embedding/images.
+        if self._mongo is not None and self._mongo.available:
+            for node in self._nodes.values():
+                self._mongo.upsert_node(node)
+            self._mongo.upsert_edges(self.get_all_edges())
+
     def _load(self) -> None:
-        """Restore from JSON file if it exists."""
+        """Restore from JSON first, then overlay / backfill MongoDB."""
         filepath = self._data_dir / "graph_store.json"
-        if not filepath.exists():
-            return
-        with open(filepath) as f:
-            data = json.load(f)
+        if filepath.exists():
+            with open(filepath) as f:
+                data = json.load(f)
 
-        self._next_short_term_id = data.get("next_short_id", 0)
-        self._next_long_term_id = data.get("next_long_id", 1000)
+            # Back-compat: legacy JSON carried next_short_id / next_long_id.
+            self._next_id = data.get(
+                "next_id",
+                max(data.get("next_short_id", 0), data.get("next_long_id", 1000)),
+            )
 
-        for nd in data.get("nodes", []):
-            node = MemoryNode.from_dict(nd)
-            self._nodes[node.node_id] = node
-            self._children[node.node_id] = set()
-            self._parents[node.node_id] = set()
+            for nd in data.get("nodes", []):
+                node = MemoryNode.from_dict(nd)
+                self._nodes[node.node_id] = node
+                self._children[node.node_id] = set()
+                self._parents[node.node_id] = set()
 
-        for ed in data.get("edges", []):
-            pid, cid = ed["from"], ed["to"]
-            self._children.setdefault(pid, set()).add(cid)
-            self._parents.setdefault(cid, set()).add(pid)
+            for ed in data.get("edges", []):
+                pid, cid = ed["from"], ed["to"]
+                self._children.setdefault(pid, set()).add(cid)
+                self._parents.setdefault(cid, set()).add(pid)
+
+        if self._mongo is not None and self._mongo.available:
+            mongo_nodes = self._mongo.all_nodes()
+            if mongo_nodes:
+                # Mongo is authoritative — replace the JSON view.
+                self._nodes = {n.node_id: n for n in mongo_nodes}
+                self._children = {nid: set() for nid in self._nodes}
+                self._parents = {nid: set() for nid in self._nodes}
+                for e in self._mongo.all_edges():
+                    self._children.setdefault(e.from_node_id, set()).add(e.to_node_id)
+                    self._parents.setdefault(e.to_node_id, set()).add(e.from_node_id)
+            else:
+                # One-time backfill: JSON history → Mongo.
+                for node in self._nodes.values():
+                    self._mongo.upsert_node(node)
+                self._mongo.upsert_edges(self.get_all_edges())
+
+        if self._nodes:
+            self._next_id = max(self._next_id, max(self._nodes) + 1)

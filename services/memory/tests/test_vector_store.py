@@ -16,8 +16,8 @@ from memory_service.storage.vector_store import TextEmbedder, BM25Index, VectorS
 class TestEmbeddingConfig:
     def test_defaults(self):
         cfg = EmbeddingModelConfig()
-        assert cfg.model_name == "all-MiniLM-L6-v2"
-        assert cfg.dim == 384
+        assert cfg.model_name == "gpahal/bge-m3-onnx-int8"
+        assert cfg.dim == 1024
         assert cfg.device == "cpu"
         # path should be expanded
         assert "~" not in cfg.model_path
@@ -53,18 +53,18 @@ class TestHashEmbedding:
 
 class TestTextEmbedder:
     def test_hash_fallback_dim(self):
-        # sentence-transformers not installed → hash fallback
+        # no real embedding model available → hash fallback
         cfg = EmbeddingModelConfig()
         emb = TextEmbedder(cfg)
         v = emb.encode("test sentence")
-        assert len(v) == 384
+        assert len(v) == 1024
 
     def test_encode_batch(self):
         cfg = EmbeddingModelConfig()
         emb = TextEmbedder(cfg)
         vecs = emb.encode_batch(["a", "b", "c"])
         assert len(vecs) == 3
-        assert all(len(v) == 384 for v in vecs)
+        assert all(len(v) == 1024 for v in vecs)
 
 
 # ── BM25 tests ──────────────────────────────────────────────────────────
@@ -194,7 +194,7 @@ class TestMultimodalInterface:
 
     def test_text_modality_works(self):
         v = self.vs.encode("hello", modality="text")
-        assert len(v) == 384
+        assert len(v) == 1024
 
     def test_visual_modality_raises_not_implemented(self):
         try:
@@ -218,7 +218,7 @@ class TestMultimodalInterface:
             assert "Unknown modality" in str(e)
 
     def test_get_dim_text(self):
-        assert self.vs.get_dim("text") == 384
+        assert self.vs.get_dim("text") == 1024
 
     def test_get_dim_unknown(self):
         try:

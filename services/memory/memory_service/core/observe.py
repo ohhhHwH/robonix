@@ -139,6 +139,7 @@ async def vlm_answer_question(
     image_paths: List[str],
     node_contexts: List[str] | None = None,
     image_root: str = "",
+    image_store=None,
 ) -> Optional[str]:
     """Send user query + node context + stored images to VLM, return answer.
 
@@ -146,7 +147,8 @@ async def vlm_answer_question(
     nodes carry ``image_refs``.  The VLM receives:
       - The user's question
       - Memory node context (summary, tags, objects, spatial)
-      - The actual image files loaded from disk
+      - The actual image files (loaded from Mongo via *image_store* when the
+        refs are ``mongo:`` markers, else from disk)
 
     Returns None when VLM is unavailable or on any failure.
     """
@@ -156,27 +158,33 @@ async def vlm_answer_question(
 
     import httpx
 
-    # Load images from disk
+    # Load images (lazy: Mongo markers resolve through ImageStore, else disk).
     content_parts: List[Dict[str, Any]] = []
     root = Path(image_root) if image_root else Path(_DEFAULT_IMAGE_ROOT).parent.parent
 
     for rel_path in image_paths[:3]:  # cap at 3 images to stay within context
-        abs_path = root / rel_path
-        if not abs_path.exists():
-            log.debug("vlm_qa: image not found: %s", abs_path)
-            continue
-        try:
-            img_bytes = abs_path.read_bytes()
-            img_b64 = base64.b64encode(img_bytes).decode("ascii")
-            # Detect format from extension: .jpg → jpeg, .png → png
-            suffix = abs_path.suffix.lower()
-            mime = "jpeg" if suffix in (".jpg", ".jpeg") else "png"
-            content_parts.append({
-                "type": "image_url",
-                "image_url": {"url": f"data:image/{mime};base64,{img_b64}"},
-            })
-        except Exception as e:
-            log.warning("vlm_qa: failed to read image %s: %s", abs_path, e)
+        img_bytes: Optional[bytes] = None
+        if image_store is not None and rel_path.startswith("mongo:"):
+            img_bytes = image_store.read_bytes_by_ref(rel_path)
+        if img_bytes is None:
+            abs_path = root / rel_path
+            if not abs_path.exists():
+                log.debug("vlm_qa: image not found: %s", abs_path)
+                continue
+            try:
+                img_bytes = abs_path.read_bytes()
+            except Exception as e:
+                log.warning("vlm_qa: failed to read image %s: %s", abs_path, e)
+                continue
+
+        img_b64 = base64.b64encode(img_bytes).decode("ascii")
+        # Detect format: marker refs are Mongo JPEGs; disk paths use extension.
+        suffix = Path(rel_path).suffix.lower()
+        mime = "jpeg" if suffix in (".jpg", ".jpeg") else "png"
+        content_parts.append({
+            "type": "image_url",
+            "image_url": {"url": f"data:image/{mime};base64,{img_b64}"},
+        })
 
     # Build text prompt with memory context + user question
     text_prompt = _VLM_QA_PROMPT

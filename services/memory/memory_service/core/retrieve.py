@@ -115,11 +115,13 @@ class RetrievePipeline:
     def __init__(self, graph_store: GraphStore, tag_index: TagIndex,
                  vector_store: VectorStore,
                  vlm_extractor=None,  # VLMFeatureExtractor or None
+                 image_store=None,
                  ):
         self._graph = graph_store
         self._tags = tag_index
         self._vectors = vector_store  # kept for optional embedding path
         self._vlm_extractor = vlm_extractor
+        self._image_store = image_store  # lazy Mongo image loader (VLM QA)
 
     async def execute(self, request: SearchRequest) -> SearchResponse:
         """Execute the search pipeline: Tier1 text index -> Tier2 rank -> filters.
@@ -378,6 +380,7 @@ class RetrievePipeline:
                         query=request.query,
                         image_paths=all_image_refs,
                         node_contexts=node_ctx,
+                        image_store=self._image_store,
                     )
                     if answer:
                         vlm_answer = answer

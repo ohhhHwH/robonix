@@ -47,6 +47,7 @@ sub-plan" path used by the ``remember`` plan shortcut.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -62,11 +63,20 @@ _DEFAULT_PTDL_PATH = str(
 
 
 class PtdlStore:
-    """Standalone JSON store for RTDL plan records (tree: query → sub-plans)."""
+    """Standalone JSON store for RTDL plan records (tree: query → sub-plans).
 
-    def __init__(self, path: str = ""):
+    MongoDB ``plan_tasks`` (``_id`` = sha1(query)) is authoritative when
+    available; the JSON file is a graceful-degradation fallback.  Each save
+    also upserts a ``memory_vectors`` row (``kind="plan"``) so plans join
+    ``vector_search`` (design doc §4/§5.1).
+    """
+
+    def __init__(self, path: str = "", *, mongo=None, milvus=None, embedder=None):
         self._path = Path(path) if path else Path(_DEFAULT_PTDL_PATH)
         self._entries: List[Dict[str, Any]] = []
+        self._mongo = mongo
+        self._milvus = milvus
+        self._embedder = embedder
         self._load()
 
     # ── Public API ────────────────────────────────────────────────────
@@ -149,6 +159,7 @@ class PtdlStore:
 
         self._recompute_counts(existing)
         self._save()
+        self._sync_milvus(existing)
         n_plans = len(existing.get("plans", []))
         log.info(
             "ptdl_store: saved plan \"%s\" (%d sub-plan(s))", query, n_plans
@@ -319,6 +330,7 @@ class PtdlStore:
             if entry.get("query") == query:
                 self._entries.pop(i)
                 self._save()
+                self._delete_backends(query)
                 return True
         return False
 
@@ -336,6 +348,15 @@ class PtdlStore:
                 log.warning("ptdl_store: failed to load %s: %s", self._path, e)
                 self._entries = []
 
+        if self._mongo is not None and self._mongo.available:
+            mongo_plans = self._mongo.all_plans()
+            if mongo_plans:
+                self._entries = mongo_plans
+            else:
+                # One-time backfill: JSON history → Mongo.
+                for entry in self._entries:
+                    self._mongo.upsert_plan(entry)
+
     def _save(self) -> None:
         self._path.parent.mkdir(parents=True, exist_ok=True)
         tmp = str(self._path) + ".tmp"
@@ -345,6 +366,59 @@ class PtdlStore:
             os.replace(tmp, str(self._path))
         except OSError as e:
             log.warning("ptdl_store: failed to save %s: %s", self._path, e)
+
+        if self._mongo is not None and self._mongo.available:
+            for entry in self._entries:
+                self._mongo.upsert_plan(entry)
+
+    # ── Milvus sync ────────────────────────────────────────────────────
+
+    @staticmethod
+    def _doc_id(query: str) -> str:
+        return hashlib.sha1((query or "").strip().encode("utf-8")).hexdigest()
+
+    def _sync_milvus(self, entry: Dict[str, Any]) -> None:
+        if self._milvus is None or not self._milvus.available:
+            return
+        if self._embedder is None:
+            return
+        query = entry.get("query", "")
+        text = f"{query} {entry.get('description', '')}".strip()
+        try:
+            vec = self._embedder.encode(text)
+        except Exception as e:  # noqa: BLE001
+            log.warning("ptdl_store: embed for plan %r failed: %s", query, e)
+            return
+        if not vec:
+            return
+        self._milvus.upsert(
+            self._doc_id(query),
+            vec,
+            kind="plan",
+            node_type="",
+            timestamp=int(entry.get("timestamp_ns") or 0),
+        )
+
+    def _delete_backends(self, query: str) -> None:
+        if self._mongo is not None and self._mongo.available:
+            self._mongo.delete_plan(query)
+        if self._milvus is not None and self._milvus.available:
+            self._milvus.delete(self._doc_id(query))
+
+    def get_by_query_key(self, key: str) -> Optional[Dict[str, Any]]:
+        """Return the plan record whose ``sha1(query)`` equals *key*, or None."""
+        for entry in self._entries:
+            if self._doc_id(entry.get("query", "")) == key:
+                return entry
+        return None
+
+    def rebuild_milvus(self) -> int:
+        """Re-upsert every plan into Milvus (on_init rebuild from Mongo)."""
+        if self._milvus is None or not self._milvus.available:
+            return 0
+        for entry in self._entries:
+            self._sync_milvus(entry)
+        return len(self._entries)
 
 
 def _entry_text(entry: Dict[str, Any]) -> str:
@@ -412,10 +486,10 @@ def _pick_description(current: str, incoming: str) -> str:
 _ptdl_store: Optional[PtdlStore] = None
 
 
-def get_ptdl_store(path: str = "") -> PtdlStore:
+def get_ptdl_store(path: str = "", *, mongo=None, milvus=None, embedder=None) -> PtdlStore:
     global _ptdl_store
     if _ptdl_store is None:
-        _ptdl_store = PtdlStore(path)
+        _ptdl_store = PtdlStore(path, mongo=mongo, milvus=milvus, embedder=embedder)
     return _ptdl_store
 
 

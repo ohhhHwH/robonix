@@ -6,6 +6,7 @@ Entrypoint for rbnx boot: `python -m memory_service.service`
 MCP tools (registered under robonix/service/memory/ alongside memsearch):
   - robonix/service/memory/remember       — write structured MemoryNode
   - robonix/service/memory/hybrid_search  — 3-stage hybrid retrieval (BM25+Embedding)
+  - robonix/service/memory/vector_search  — BGE-M3 semantic search (Milvus)
   - robonix/service/memory/promote        — promote short-term → long-term
 
 Runs in parallel with memsearch (save/search/compact) under the same
@@ -53,7 +54,7 @@ def _log_environment() -> None:
         log.info("embedding model path: %s (exists=%s)",
                  model_path, os.path.isdir(model_path))
     else:
-        log.info("embedding model source: sentence-transformers standard cache")
+        log.info("embedding model source: BGE-M3 ONNX (gpahal/bge-m3-onnx-int8)")
 
 
 # ── 1. Core backend imports (no rbnx-api dependency) ───────────────────
@@ -68,6 +69,9 @@ from .storage.tag_index import TagIndex  # noqa: E402
 from .storage.vector_store import VectorStore  # noqa: E402
 from .storage.embedding_config import EmbeddingModelConfig  # noqa: E402
 from .storage.image_store import ImageStore  # noqa: E402
+from .storage.mongo_backend import MongoBackend  # noqa: E402
+from .storage.milvus_backend import MilvusBackend  # noqa: E402
+from .storage.bge_embedder import BgeEmbedder  # noqa: E402
 from .core.remember import RememberPipeline  # noqa: E402
 from .core.retrieve import RetrievePipeline  # noqa: E402
 from .core.compact import CompactPipeline  # noqa: E402
@@ -146,10 +150,17 @@ def _reset_memory_state() -> None:
     if os.path.exists(ptdl_json):
         os.remove(ptdl_json)
     try:
-        from .storage.ptdl_store import _ptdl_store_reset
-        _ptdl_store_reset()
+        from .storage import ptdl_store as _ps
+        _ps._ptdl_store_reset()
+        # Re-create the singleton wired to the shared backends.
+        _ps.get_ptdl_store(mongo=_mongo, milvus=_milvus, embedder=_bge)
     except Exception:
         pass
+    # PTDL deletion (explicit /reset) also clears plan vectors + Mongo plans.
+    if _milvus is not None:
+        _milvus.clear_kind("plan")
+    if _mongo is not None:
+        _mongo.clear_plans()
 
     images_dir = str(Path(__file__).resolve().parent.parent / "data" / "images")
     if os.path.isdir(images_dir):
@@ -187,13 +198,31 @@ log.info("scribe_mem: graph_store → %s", os.path.join(MEMORY_DIR, "graph_store
 log.info("scribe_mem: scribe_log  → %s", os.path.join(_LOG_DIR, "service_memory.log"))
 log.info("scribe_mem: backend     → %s + %s + %s + ImageStore", graph_type, idx_type, vec_type)
 
-_graph = GraphStore(data_dir=MEMORY_DIR)
+_mongo = MongoBackend()
+_milvus = MilvusBackend()
+_bge = BgeEmbedder(EmbeddingModelConfig())
+
+# Clean-start wipes the ephemeral scene data in every backend (Mongo scene
+# nodes/edges + Milvus scene vectors). Plan memory (plan_tasks / kind="plan")
+# is long-term and deliberately preserved.
+if not _KEEP_DATA:
+    _mongo.clear_scene()
+    _mongo.clear_edges()
+    _milvus.clear_kind("scene")
+
+_graph = GraphStore(data_dir=MEMORY_DIR, mongo=_mongo, milvus=_milvus, embedder=_bge)
 _tags = TagIndex()
-_vectors = VectorStore(alpha=0.3, embedding_enabled=_ENABLE_EMBEDDING)
-_images = ImageStore()
+_vectors = VectorStore(alpha=0.3, embedding_enabled=_ENABLE_EMBEDDING,
+                       embedder=_bge if _ENABLE_EMBEDDING else None)
+_images = ImageStore(mongo=_mongo)
 _remember_pipe = RememberPipeline(_graph, _tags, _vectors, _images)
-_retrieve_pipe = RetrievePipeline(_graph, _tags, _vectors)
+_retrieve_pipe = RetrievePipeline(_graph, _tags, _vectors, image_store=_images)
 _compact_pipe = CompactPipeline(_graph)
+
+# Eagerly create the PTDL singleton wired to Mongo/Milvus so plan vectors
+# join vector_search; later get_ptdl_store() calls return this instance.
+from .storage.ptdl_store import get_ptdl_store as _get_ptdl_store  # noqa: E402
+_ptdl = _get_ptdl_store(mongo=_mongo, milvus=_milvus, embedder=_bge)
 
 # ── 2c. Scene Hook HTTP server ───────────────────────────────────────
 # Must start at module level — rbnx boot calls robonix_api.Service.run()
@@ -362,6 +391,14 @@ if _MCP_AVAILABLE:
                 "(use today / yesterday / last_week)"
             )
         return int(start.timestamp() * 1e9), int(end.timestamp() * 1e9)
+
+    def _lean_node(node) -> dict:
+        """Serialize a node for vector_search — no images/frame_ts/embedding."""
+        d = node.to_dict()
+        for k in ("embedding", "image_refs", "frame_ts",
+                  "depth_refs", "video_clip_refs"):
+            d.pop(k, None)
+        return d
 
     # ── MCP tool handlers ──────────────────────────────────────────────
 
@@ -826,6 +863,140 @@ if _MCP_AVAILABLE:
                  start_ts, end_ts, len(tasks))
         return _json_ok({"tasks": tasks})
 
+    @_memory_svc.mcp("robonix/service/memory/vector_search")
+    async def _mcp_vector_search(msg: String) -> String:
+        """Semantic (vector) search across scene memories and saved plans.
+
+        Runs a BGE-M3 ANN query against the Milvus ``memory_vectors`` index
+        and returns the matching Mongo docs (scene nodes lean — no images /
+        frame_ts / embedding — or plan records).  Use this for meaning-based
+        recall ("find the scene where I placed the cup"); use hybrid_search
+        for tag-filtered retrieval.
+
+        Request JSON schema:
+        {
+          "query":    "去厨房拿可乐",            // required — semantic query
+          "kind":     "all",                      // scene | plan | all (default all)
+          "top_k":    5,                          // default 5
+          "node_type": "short_term",              // optional — scene node_type filter
+          "time_range": {"start_ts": <ns>, "end_ts": <ns>}  // optional
+        }
+
+        kind "all" (default) runs two INDEPENDENT top-k — scene objects and
+        historical plans live in different semantic spaces, so they are never
+        merged into one ranking; each kind returns its own top_k results:
+
+        Response JSON (kind="all"):
+        {
+          "scene": {"count": 5, "results": [
+            {"doc_id": "7", "kind": "scene", "node_type": "short_term",
+             "timestamp": 1765432100123456789, "score": 0.83, "node": { ... }}, ...]},
+          "plan": {"count": 5, "results": [
+            {"doc_id": "a1b2...", "kind": "plan", "score": 0.71, "plan": { ... }}, ...]}
+        }
+
+        kind "scene" / "plan" return a single flat list:
+        {
+          "count": 2,
+          "results": [ ...same item shape as above... ]
+        }
+        On error: {"error": "<description>"}
+        """
+        req_dict = _parse_json(msg.data, ctx="vector_search")
+        if req_dict is None:
+            return _json_error("Invalid JSON in request body", ctx="vector_search")
+
+        query = (req_dict.get("query") or "").strip()
+        if not query:
+            return _json_error("Missing required field: query", ctx="vector_search")
+
+        kind = (req_dict.get("kind") or "all").strip().lower()
+        if kind not in ("scene", "plan", "all"):
+            return _json_error("Invalid kind: must be scene | plan | all",
+                              ctx="vector_search")
+
+        try:
+            top_k = max(1, min(int(req_dict.get("top_k", 5)), 100))
+        except (TypeError, ValueError):
+            return _json_error("Invalid top_k: must be an integer", ctx="vector_search")
+
+        node_type = (req_dict.get("node_type") or "").strip() or None
+        time_range = None
+        if req_dict.get("time_range"):
+            try:
+                tr = req_dict["time_range"]
+                time_range = (int(tr.get("start_ts", 0)), int(tr.get("end_ts", 0)))
+            except (TypeError, ValueError):
+                return _json_error("Invalid time_range", ctx="vector_search")
+
+        qvec = _bge.encode(query)
+
+        def _enrich(hits: list) -> list:
+            results: list = []
+            for h in hits:
+                item = {
+                    "doc_id": h["doc_id"],
+                    "kind": h["kind"],
+                    "node_type": h["node_type"],
+                    "timestamp": h["timestamp"],
+                    "score": round(h["score"], 4),
+                }
+                if h["kind"] == "scene" and h["doc_id"].isdigit():
+                    node = _graph.get_node(int(h["doc_id"]))
+                    if node is None and _mongo.available:
+                        node = _mongo.get_node(int(h["doc_id"]))
+                    if node is not None:
+                        item["node"] = _lean_node(node)
+                elif h["kind"] == "plan":
+                    plan = _mongo.get_plan_by_key(h["doc_id"]) if _mongo.available else None
+                    if plan is None:
+                        plan = _ptdl.get_by_query_key(h["doc_id"])
+                    if plan is not None:
+                        item["plan"] = plan
+                results.append(item)
+            return results
+
+        if kind == "all":
+            # Scene objects and historical plans are different semantic
+            # spaces; a single merged ranking would make their scores
+            # non-comparable.  Run one ANN search per kind, each truncated to
+            # its own top_k, and return the two lists separately.
+            scene_hits = _milvus.search(
+                qvec,
+                top_k=top_k,
+                kind="scene",
+                node_type=node_type,
+                time_range=time_range,
+            )
+            plan_hits = _milvus.search(
+                qvec,
+                top_k=top_k,
+                kind="plan",
+                node_type=None,
+                time_range=time_range,
+            )
+            scene_results = _enrich(scene_hits)
+            plan_results = _enrich(plan_hits)
+            log.info("API vector_search: query=%r kind=all top_k=%d → scene=%d plan=%d",
+                     query[:80], top_k, len(scene_results), len(plan_results))
+            return _json_ok({
+                "scene": {"count": len(scene_results), "results": scene_results},
+                "plan": {"count": len(plan_results), "results": plan_results},
+            })
+
+        hits = _milvus.search(
+            qvec,
+            top_k=top_k,
+            kind=kind,
+            node_type=node_type,
+            time_range=time_range,
+        )
+        results = _enrich(hits)
+
+        log.info("API vector_search: query=%r kind=%s top_k=%d → %d hits",
+                 query[:80], kind, top_k, len(results))
+        return _json_ok({"count": len(results), "results": results})
+
     @_memory_svc.on_init
     def _on_init(cfg):
         _ = cfg
@@ -848,8 +1019,14 @@ if _MCP_AVAILABLE:
             _tags.rebuild(nodes)
             vec_triples = [(n.node_id, n.embedding, n.summary) for n in nodes]
             _vectors.rebuild(vec_triples)
+
+            # Rebuild the Milvus vector index from Mongo/JSON (re-embedding
+            # scene nodes + plans) so a fresh/empty Milvus catches up.
+            n_scene = _graph.rebuild_milvus()
+            n_plan = _ptdl.rebuild_milvus()
             _indices_initialized = True
-            log.info("on_init: indices rebuilt for %d nodes", len(nodes))
+            log.info("on_init: indices rebuilt for %d nodes; milvus=%d scene + %d plan",
+                     len(nodes), n_scene, n_plan)
         except Exception as e:
             log.warning("on_init: index rebuild failed (empty store?): %s: %s",
                         type(e).__name__, e)

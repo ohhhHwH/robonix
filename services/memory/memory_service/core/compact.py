@@ -1,7 +1,8 @@
 """Compact pipeline — promote ShortTerm nodes to LongTerm, generate summary.
 
-Phase1: promotes short-term nodes (0-999) to long-term range (1000+)
-if they exceed a configurable count threshold.
+Phase1: promotes overflowing short-term nodes (by node_type, not ID range)
+to long-term when they exceed a configurable count threshold.  ``node_id``
+is stable across promote — only ``node_type`` flips.
 Phase2: LLM-based summarization of compacted nodes.
 """
 
@@ -54,7 +55,7 @@ class CompactPipeline:
             new_id = self._graph.promote_to_long_term(node.node_id)
             if new_id is not None:
                 promoted_count += 1
-                log.debug("compact: promoted %d → %d", node.node_id, new_id)
+                log.debug("compact: promoted node %d to long-term (id unchanged)", new_id)
 
         summary = (
             f"Compacted {promoted_count} short-term nodes → long-term "

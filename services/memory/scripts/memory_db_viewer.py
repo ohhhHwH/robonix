@@ -16,13 +16,21 @@ parquet segments + append-only arrow WAL) with pyarrow and reconstructing the
 current rows without acquiring the lock — so it stays live while the service
 runs.
 
+When Robonix (and thus MongoDB) is offline, the viewer falls back to the
+on-disk JSON snapshots the service writes for graceful degradation
+(``graph_store.json`` / ``ptdl_store.json``), so the same page still shows the
+last-persisted scene nodes, causal edges and plan tasks.  Milvus is always read
+from its raw on-disk files and needs no server.
+
 Usage:
 
     cd services/memory
     rbnx-build/venv/bin/python scripts/memory_db_viewer.py \
         [--port 8899] [--host 127.0.0.1] \
         [--mongo-uri mongodb://127.0.0.1:27017/robonix_memory] \
-        [--milvus-uri ./memory/robonix_memory.db]
+        [--milvus-uri ./memory/robonix_memory.db] \
+        [--graph-json ./memory/graph_store.json] \
+        [--plan-json ./memory/ptdl_store.json]
 
 Then open http://127.0.0.1:8899/ .  Only stdlib + pymongo + pyarrow are
 required (no Flask / web framework); pymilvus is used only for remote
@@ -84,6 +92,72 @@ def read_mongo(uri: str) -> dict:
         }
     except Exception as e:  # mongod down, etc.
         return {"available": False, "error": f"{type(e).__name__}: {e}"}
+
+
+def read_json_snapshots(graph_json: str, plan_json: str) -> dict:
+    """Offline fallback: rebuild the Mongo-shaped view from the on-disk JSON
+    snapshots the service writes for graceful degradation.
+
+    Requires no MongoDB / Milvus / running service — only the two snapshot
+    files.  Returns the same shape as :func:`read_mongo` (``_id`` / counts /
+    row lists) so the front-end renders identically; ``source="json_snapshot"``
+    marks it as offline data.  Missing or unreadable files simply yield empty
+    tables rather than an error.
+    """
+    import hashlib
+
+    def _load(path):
+        try:
+            with open(path, encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return None
+
+    gs = _load(graph_json) or {}
+    ps = _load(plan_json)
+
+    scene_nodes = [{
+        "_id": n.get("node_id"),
+        "node_type": n.get("node_type"),
+        "summary": n.get("summary"),
+        "summary_zh": n.get("summary_zh"),
+        "image_count": len(n.get("image_refs") or []),
+        "weight": n.get("weight"),
+        "causal_chain": n.get("causal_chain"),
+    } for n in (gs.get("nodes") or [])]
+    scene_nodes.sort(key=lambda n: n["_id"])
+
+    causal_edges = [{
+        "_id": f"{e.get('from')}->{e.get('to')}",
+        "from": e.get("from"),
+        "to": e.get("to"),
+        "relation": None,  # JSON snapshots persist only from/to
+    } for e in (gs.get("edges") or [])]
+    causal_edges.sort(key=lambda e: e["_id"])
+
+    plan_tasks = [{
+        "_id": hashlib.sha1((p.get("query") or "").encode("utf-8")).hexdigest(),
+        "query": p.get("query"),
+        "description": p.get("description"),
+        "plan_count": p.get("plan_count"),
+        "canceled_count": p.get("canceled_count"),
+        "timestamp_ns": p.get("timestamp_ns"),
+    } for p in (ps or []) if (p.get("query") or "").strip()]
+    plan_tasks.sort(key=lambda p: p.get("timestamp_ns") or 0, reverse=True)
+
+    return {
+        "available": True,
+        "source": "json_snapshot",
+        "db": "graph_store.json + ptdl_store.json (offline)",
+        "counts": {
+            "scene_nodes": len(scene_nodes),
+            "causal_edges": len(causal_edges),
+            "plan_tasks": len(plan_tasks),
+        },
+        "scene_nodes": scene_nodes,
+        "causal_edges": causal_edges,
+        "plan_tasks": plan_tasks,
+    }
 
 
 def read_milvus(uri: str) -> dict:
@@ -322,7 +396,9 @@ async function refresh() {
     const r = await fetch('/api/data');
     const d = await r.json();
     const b = [];
-    if (d.mongo && !d.mongo.available) b.push(['err', 'MongoDB 不可用：' + (d.mongo.error || '')]);
+    if (d.mongo && d.mongo.source === 'json_snapshot')
+      b.push(['warn', 'MongoDB 离线 · 显示本地 JSON 快照（graph_store.json / ptdl_store.json）']);
+    else if (d.mongo && !d.mongo.available) b.push(['err', 'MongoDB 不可用：' + (d.mongo.error || '')]);
     if (d.milvus && d.milvus.locked) b.push(['warn', d.milvus.hint || 'Milvus 被锁']);
     else if (d.milvus && d.milvus.error) b.push(['warn', 'Milvus：' + d.milvus.error]);
     banner(b.length ? b[0][0] : null, b.length ? b[0][1] : '');
@@ -365,8 +441,12 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         path = urlparse(self.path).path
         if path == "/api/data":
+            mongo = read_mongo(self.server.mongo_uri)
+            if not mongo.get("available"):
+                mongo = read_json_snapshots(
+                    self.server.graph_json, self.server.plan_json)
             payload = {
-                "mongo": read_mongo(self.server.mongo_uri),
+                "mongo": mongo,
                 "milvus": read_milvus(self.server.milvus_uri),
             }
             dumps = json_util.dumps if json_util else json.dumps
@@ -391,14 +471,23 @@ def main(argv=None):
     ap.add_argument("--milvus-uri",
                     default=os.environ.get("MEMGRAPH_MILVUS_URI",
                                            "./memory/robonix_memory.db"))
+    ap.add_argument("--graph-json",
+                    default=os.environ.get("MEMGRAPH_GRAPH_JSON",
+                                           "./memory/graph_store.json"))
+    ap.add_argument("--plan-json",
+                    default=os.environ.get("MEMGRAPH_PLAN_JSON",
+                                           "./memory/ptdl_store.json"))
     args = ap.parse_args(argv)
 
     server = ThreadingHTTPServer((args.host, args.port), Handler)
     server.mongo_uri = args.mongo_uri
     server.milvus_uri = args.milvus_uri
+    server.graph_json = args.graph_json
+    server.plan_json = args.plan_json
     print(f"Memory DB viewer on http://{args.host}:{args.port}/")
     print(f"  mongo : {args.mongo_uri}")
     print(f"  milvus: {args.milvus_uri}")
+    print(f"  json  : {args.graph_json} / {args.plan_json} (offline fallback)")
     print("  (Ctrl-C to stop)")
     try:
         server.serve_forever()

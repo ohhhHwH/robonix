@@ -34,12 +34,8 @@ def _locked(method):
 
 
 def _scene_embed_text(node: MemoryNode) -> str:
-    """Bilingual embed text for a scene node (design doc §4)."""
-    zh = (node.summary_zh or "").strip()
-    en = (node.summary_en or "").strip()
-    if zh and en:
-        return f"{zh} / {en}"
-    return node.summary or zh or en
+    """English embed text for a scene node (design doc 补充：双路径 embedding)."""
+    return (node.summary_en or node.summary or "").strip()
 
 
 class GraphStore:

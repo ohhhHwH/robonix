@@ -72,6 +72,7 @@ from .storage.image_store import ImageStore  # noqa: E402
 from .storage.mongo_backend import MongoBackend  # noqa: E402
 from .storage.milvus_backend import MilvusBackend  # noqa: E402
 from .storage.bge_embedder import BgeEmbedder  # noqa: E402
+from .storage.translator import Translator  # noqa: E402
 from .core.remember import RememberPipeline  # noqa: E402
 from .core.retrieve import RetrievePipeline  # noqa: E402
 from .core.compact import CompactPipeline  # noqa: E402
@@ -201,6 +202,9 @@ log.info("scribe_mem: backend     → %s + %s + %s + ImageStore", graph_type, id
 _mongo = MongoBackend()
 _milvus = MilvusBackend()
 _bge = BgeEmbedder(EmbeddingModelConfig())
+# Scene summaries are English; translate to Chinese before embedding so the
+# scene vector matches Chinese queries (degrades to a no-op when unavailable).
+_translator = Translator()
 
 # Clean-start wipes the ephemeral scene data in every backend (Mongo scene
 # nodes/edges + Milvus scene vectors). Plan memory (plan_tasks / kind="plan")
@@ -210,7 +214,8 @@ if not _KEEP_DATA:
     _mongo.clear_edges()
     _milvus.clear_kind("scene")
 
-_graph = GraphStore(data_dir=MEMORY_DIR, mongo=_mongo, milvus=_milvus, embedder=_bge)
+_graph = GraphStore(data_dir=MEMORY_DIR, mongo=_mongo, milvus=_milvus,
+                    embedder=_bge, translator=_translator)
 _tags = TagIndex()
 _vectors = VectorStore(alpha=0.3, embedding_enabled=_ENABLE_EMBEDDING,
                        embedder=_bge if _ENABLE_EMBEDDING else None)

@@ -24,6 +24,8 @@ dependencies = [
     "robonix-api",
     "pyyaml>=6.0",
     "httpx>=0.27",
+    # Marian opus-mt-en-zh tokenizer (Translator, EN→ZH scene-summary embedding).
+    "sentencepiece>=0.2",
 ]
 
 # sentence-transformers is optional — install manually or via:

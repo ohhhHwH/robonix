@@ -189,11 +189,17 @@ th .thsub {{ color:var(--dim); font-weight:400; font-size:11px; }}
 生成于 {meta['generated_at'][:19]}</p>
 
 <div class="paths">
-  <div class="pn">query（{meta['queries']}）</div>
-  <div class="arrow">─BGE-M3→</div>
-  <div class="pn"><b>mem node 路径</b> × {meta['mem_nodes']}（问题）</div>
-  <div class="pn"><b>scene node 路径</b> × {meta['scene_nodes']}（物体观测）</div>
+  <div class="pn">query × {meta['queries']}（中文）</div>
+  <div class="arrow">─BGE-M3 单次编码→</div>
+  <div class="pn">1024 维向量</div>
 </div>
+<div class="paths">
+  <div class="pn"><b>mem node 路径</b> × {meta['mem_nodes']}：问题（中文）→ 直接嵌入</div>
+</div>
+<div class="paths">
+  <div class="pn"><b>scene node 路径</b> × {meta['scene_nodes']}：summary_en（英文）→ <b>翻译模型 EN→ZH</b> → 中文 → 嵌入</div>
+</div>
+<p class="sub">说明：scene node 比 mem node <b>多经过一个翻译模型</b>（Xenova/opus-mt-en-zh，EN→ZH）——VLM 用英文写场景摘要（summary_en），先译成中文再交 BGE-M3 嵌入，使场景向量与中文 query 同语言（跨语言 → 同语言，检索更稳）。</p>
 
 <div class="cards">
   <div class="card"><div class="n">{pct(mem_hits)}</div><div class="l">mem node 路径 top-1 命中</div></div>

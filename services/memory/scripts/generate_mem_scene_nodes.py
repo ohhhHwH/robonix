@@ -9,7 +9,7 @@ and drops the real ``node_embed_texts.json`` data (per "不要真实场景"):
                                  question types). Embedding text = the question.
 * ``scene_node_100_1030.json`` — 100 "scene node" (object observations, 20
                                  objects × 5 regions). Embedding text =
-                                 ``successfully observe <obj> in <region>``.
+                                 ``成功观察到<物体>在<区域>``（中文）。
 * ``query_1030.json``          — 100 test queries, one paraphrase per mem node,
                                  linked by ``mem_node_id``.
 
@@ -87,7 +87,7 @@ def main() -> int:
                 "object_zh": zh,
                 "region": region_en,
                 "region_zh": region_zh,
-                "embed_text": f"successfully observe {label} in {region_en}",
+                "embed_text": f"成功观察到{zh}在{region_zh}",
             })
     for m in mem:
         queries.append({
@@ -107,7 +107,7 @@ def main() -> int:
     })
     _write(base, "scene_node_100_1030.json", {
         "meta": {"total": len(scene), "node_type": "scene",
-                 "embed_text": "successfully observe {object} in {region}",
+                 "embed_text": "成功观察到{物体}在{区域}",
                  "regions": len(REGIONS), "objects": len(OBJECTS)},
         "scene_nodes": scene,
     })

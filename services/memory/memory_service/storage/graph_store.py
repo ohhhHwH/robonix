@@ -33,11 +33,6 @@ def _locked(method):
     return wrapper
 
 
-def _scene_embed_text(node: MemoryNode) -> str:
-    """English embed text for a scene node (design doc 补充：双路径 embedding)."""
-    return (node.summary_en or node.summary or "").strip()
-
-
 class GraphStore:
     """Persistent store for MemoryNode and causal edges.
 
@@ -55,7 +50,8 @@ class GraphStore:
     # When run via rbnx boot, CWD = services/memory/ → data at ./memory/
     DEFAULT_DATA_DIR = os.path.join(os.getcwd(), "memory")
 
-    def __init__(self, data_dir: str = "", *, mongo=None, milvus=None, embedder=None):
+    def __init__(self, data_dir: str = "", *, mongo=None, milvus=None, embedder=None,
+                 translator=None):
         self._data_dir = Path(data_dir or self.DEFAULT_DATA_DIR)
         self._data_dir.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
@@ -72,6 +68,7 @@ class GraphStore:
         self._mongo = mongo
         self._milvus = milvus
         self._embedder = embedder
+        self._translator = translator
 
         self._load()
 
@@ -263,6 +260,18 @@ class GraphStore:
         self._sync_milvus_upsert(node)
         return node_id
 
+    def _scene_embed_text(self, node: MemoryNode) -> str:
+        """Chinese embed text for a scene node (design doc 补充：双路径 embedding).
+
+        The VLM writes ``summary_en``; translate it to Chinese so the scene
+        vector matches the Chinese queries it is ranked against. Degrades to
+        English when the translator is absent or not loaded.
+        """
+        text = (node.summary_en or node.summary or "").strip()
+        if self._translator is not None and text:
+            return self._translator.translate(text).strip() or text
+        return text
+
     def _milvus_vector(self, node: MemoryNode) -> List[float]:
         """Return the cached vector, computing + caching it when empty."""
         if node.embedding:
@@ -270,7 +279,7 @@ class GraphStore:
         if self._embedder is None:
             return []
         try:
-            vec = self._embedder.encode(_scene_embed_text(node))
+            vec = self._embedder.encode(self._scene_embed_text(node))
             node.embedding = vec
             return vec
         except Exception as e:  # noqa: BLE001 — vector index is best-effort

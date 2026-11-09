@@ -308,18 +308,20 @@ Milvus 是派生索引，必须随 MongoDB 的每次变更同步，否则检索�
 > （1024 维、中英双语、一个 `memory_vectors` collection），把「场景 / 规划」拆成
 > **两条 embedding 输入路径**，而非拆成两个模型。
 
-### 1) 双路径 embedding（场景英文、规划中文）
+### 1) 双路径 embedding（场景、规划均中文）
 
 BGE-M3 本身中英双语、共享一个 1024 维语义空间，因此场景与规划**继续共用同一模型、
-同一 Milvus 集合**，只是喂给模型的**输入文本语言不同**：
+同一 Milvus 集合**。两条路径最终喂给模型的都是**中文**：规划本就是中文
+（`query`/`description`），场景的英文摘要（VLM 产出 `summary_en`）先经本地 ONNX
+翻译模型译成中文再 embed：
 
 ```text
                       ┌──────────────────────────────────┐
                       │        BGE-M3（单模型，1024）     │
                       └──────────────────────────────────┘
                           ▲                        ▲
-         路径 ① scene（英文）               路径 ② plan（中文）
-          embed(summary_en)                  embed(query + " " + description)
+         路径 ① scene（中文）               路径 ② plan（中文）
+         embed(translate(summary_en))       embed(query + " " + description)
                           │                        │
                           ▼                        ▼
               Milvus memory_vectors           Milvus memory_vectors
@@ -328,19 +330,23 @@ BGE-M3 本身中英双语、共享一个 1024 维语义空间，因此场景与�
 
 | 路径 | 要 embed 的文本 | 语言 | 落库 kind |
 |---|---|---|---|
-| ① 场景 | `summary_en`（缺省回退 `summary`） | 英文 | `scene` |
+| ① 场景 | `translate(summary_en)`（翻译不可用回退 `summary_en`） | 中文 | `scene` |
 | ② 规划 | `query + " " + description` | 中文 | `plan` |
 
-- **为什么场景走英文、规划走中文**：场景摘要由 VLM 富化产出，英文摘要语义最稳定
-  （当前 63 条 scene 向量全为英文 summary）；规划是 LLM 对中文指令的任务描述，
-  `query`/`description` 天然中文。各用母语路径，避免跨语言转译折损。
+- **为什么场景也走中文**：检索 query 是中文，同语言 embedding 匹配强于跨语言——
+  合成测试（100 query）中 scene 路径 top-1 命中由英文 `summary_en` 的 **80%** 提升到
+  中文的 **100%**。场景摘要由 VLM 产出英文（`summary_en`），用本地轻量 ONNX 翻译模型
+  （opus-mt-en-zh）译成中文再 embed，翻译不可用时回退英文原文。
+- **翻译模型**：`storage/translator.py`，本地 ONNX（`Xenova/opus-mt-en-zh` 量化
+  encoder/decoder + Helsinki tokenizer），仅复用已存在的 onnxruntime + sentencepiece，
+  不引入 torch/transformers；加载失败时 `translate` 原样返回，服务仍可启动。
 - **检索侧不变**：`vector_search(query, kind)` 把 query 用 BGE-M3 embed 一次，再按
   `kind` filter 到对应路径的向量上做 ANN；`kind="all"` 时对 scene / plan 各自 top_k、
   **不合并排名**（见 §6「kind 分路检索」）。
 - **与 §4.1 原文的衔接**：§4.1 写「场景 = `summary_zh + " / " + summary_en`」为早期
-  折衷；本补充将其收敛为**场景只取 `summary_en`**（规划仍 `query + description`）。
-  代码落地时以本节为准：`graph_store._scene_embed_text` 优先 `summary_en`，
-  `ptdl_store._sync_milvus` 保持 `query + description`。
+  折衷；本补充收敛为**场景取 `translate(summary_en)` 的中文**（规划仍 `query +
+  description`）。代码落地以本节为准：`graph_store._scene_embed_text` 把 `summary_en`
+  译成中文再返回，`ptdl_store._sync_milvus` 保持 `query + description`。
 - **好处**：模型、权重、ONNX、schema、`_hash_embedding` 兜底全部只需一份，不引入
   第二套 768 维模型与第二个 collection，运维与重建成本不变。
 
@@ -348,7 +354,7 @@ BGE-M3 本身中英双语、共享一个 1024 维语义空间，因此场景与�
 
 原则：**Mongo 只存「检索 / 回放必需 + 重建所需」**；派生向量进 Milvus，图片懒加载，
 VLM/LLM 的原始中间输出一律不落库。场景与规划各保留唯一 embedding 文本源
-（scene=`summary_en`、plan=`query + description`），其余字段按需精简。
+（scene=translate(`summary_en`)、plan=`query + description`），其余字段按需精简。
 
 **场景节点 `scene_nodes` 精简模板：**
 
@@ -378,7 +384,7 @@ VLM/LLM 的原始中间输出一律不落库。场景与规划各保留唯一 em
 }
 ```
 
-- **保留**：`_id`(node_id)、`node_type`、`timestamp`、`summary_en`（英文 embedding 源）+
+- **保留**：`_id`(node_id)、`node_type`、`timestamp`、`summary_en`（经翻译成中文的 embedding 源）+
   `summary_zh`（展示用，可选）、`tags`（四维标签，含 `objects_present` 紧凑物体标签，
   供 TagIndex 过滤）、`causal_chain`、`weight`、`images`（懒加载、JPEG 压缩、限帧数）、
   `frame_ts`、`version`。
@@ -430,7 +436,7 @@ VLM/LLM 的原始中间输出一律不落库。场景与规划各保留唯一 em
 | 字段 | 精简后处理 | 理由 |
 |---|---|---|
 | `node_id` / `node_type` / `version` | **保留** | 主键、类型、乐观锁 |
-| `summary` / `summary_zh` / `summary_en` | **保留** | `summary_en` 是 scene embedding 源 |
+| `summary` / `summary_zh` / `summary_en` | **保留** | `summary_en`（经翻译）是 scene embedding 源 |
 | `timestamp` / `created_at` | **保留** | 时间窗口 filter / 审计 |
 | `tags`（四维，含 `objects_present`） | **保留** | TagIndex 过滤；紧凑物体标签替代 3D 坐标 |
 | `causal_chain` / `weight` | **保留** | 因果 / 检索权重 |
@@ -460,8 +466,9 @@ Milvus（`memory_vectors`）与内存 `node.embedding` 缓存：
   元数据 + `images` Binary。
 - JSON 快照 `graph_store.py::_persist` 序列化时同样 `pop("embedding")`，与 Mongo 口径
   一致（`ptdl_store.json` 本就无 embedding）。
-- 回源重建：Mongo/JSON 读回的节点无 `embedding`，`_milvus_vector` 按 `summary_en`
-  现算（BGE-M3）再写 Milvus——向量是**派生索引**，丢了可全量重建，不属事实源。
+- 回源重建：Mongo/JSON 读回的节点无 `embedding`，`_milvus_vector` 按
+  `translate(summary_en)` 现算（BGE-M3）再写 Milvus——向量是**派生索引**，丢了可全量
+  重建，不属事实源。
 
 #### 3.4 测试双写（DB + JSON）
 

@@ -197,3 +197,116 @@ Pilot 问"地球仪昨天被碰过吗？"
 - `_append_image_ref` 同步更新 `timestamp` / `frame_ts` / `version`；
 - `to_dict` / `from_dict` 与 Mongo 精简模板**无需改字段**（只用现有
   `timestamp` / `image_refs` / `frame_ts`）。
+
+## 6. 统一 MCP 工具：mem_remember + mem_search（多路检索 + 重排）（待实现 ⬜）
+
+> 目标：把现有 7 个 MCP tool 收敛为 **2 个** —— `mem_remember`（统一写）+
+> `mem_search`（统一读，多路召回 + RRF 重排）；`promote` 转内部自动触发。
+
+### 6.1 最终接口
+
+| tool | 职责 |
+|---|---|
+| `mem_remember` | 统一写入：`type=memory`（CKG 节点）/ `type=plan`（计划） |
+| `mem_search` | 统一读取：多路召回（向量/关键字/标签/因果/LLM）+ RRF 重排 top-k |
+
+### 6.2 mem_remember（写）
+
+用 `type` 判别，一路 handler、两套字段：
+
+```jsonc
+{ "type": "memory", "session_id": "…", "log_record": { … } }
+{ "type": "plan",   "query": "去厨房拿可乐", "steps": [ … ] }
+```
+
+- `type=memory` → 现 `remember`（session_id / plan_id / log_record / spatial /
+  parent_node_id / image_base64 / depth_base64 / camera_params / time_range / kv）。
+- `type=plan` → 现 `ptdl_remember`（query / description / steps / plan_count /
+  canceled_count / rtdl_plan / raw_rtdl / plan_id）。
+- 内部路由到 `RememberPipeline` 或 `ptdl_store.add`；返回 `node_id` 或 `{ok}`。
+
+### 6.3 mem_search（读）：多路 + 重排
+
+#### 6.3.1 多路召回（5 路）
+
+| 路 | 数据 / 机制 | 分数 | 复用 |
+|---|---|---|---|
+| vector | BGE-M3 → Milvus ANN | cosine | `MilvusBackend.search` |
+| keyword | BM25 词法匹配 summary/raw_log/tags | BM25 | `VectorStore.search`（BM25 侧） |
+| tag | 标签倒排 AND + 重叠度 | Jaccard | `TagIndex.query` |
+| causal | `causal_chain` 因果/上下文扩展 | 增益 | `retrieve.py` Stage3 |
+| llm | LLM 相关性排序（可选、贵） | rank | `llm_search.llm_rank` |
+
+#### 6.3.2 重排：RRF（默认）
+
+各路由分数量纲不同（cosine vs BM25 vs LLM rank）不能直接相加，用 Reciprocal
+Rank Fusion：
+
+```text
+RRF(d) = Σ_r  1 / (60 + rank_r(d))
+```
+
+`rank_r(d)` = 文档 d 在路由 r 中的名次（未进该路记 0）；可选加权 RRF：
+`Σ_r w_r / (60 + rank_r(d))`。排序取 top-k。备选 weighted 线性融合需先归一化、
+对权重敏感，不推荐做默认。
+
+#### 6.3.3 预过滤 + 后处理
+
+- **预过滤**：`domain`（all/memory/scene/plan）+ `tags`（AND）+ `time`
+  （relative_time / time_range），先缩小候选再跑各路。
+- **后处理**：gap 聚类 + 多图 VLM（承接 §5 / 上轮设计：top-k 相邻 score 落差
+  截断 → 按时间 anchor 取图 → 喂 VLM），`vlm_qa:true` 时启用。
+
+#### 6.3.4 请求 / 响应
+
+```jsonc
+// 请求
+{ "query": "…", "top_k": 5, "domain": "all",            // all|memory|scene|plan
+  "routes": ["vector","keyword","tag","causal"],         // 默认不含 llm（贵）
+  "fusion": "rrf", "route_weights": { "vector": 1.0 },
+  "tags": { "objects": ["red cup"], "action_type": "grasp" },
+  "time": { "relative_time": "yesterday" } | { "start_ts": 0, "end_ts": 0 },
+  "vlm_qa": false, "gap_threshold": 0.05, "min_sim": 0.5 }
+
+// 响应
+{ "results": [ { "doc_id", "kind", "score",
+                 "route_scores": { "vector": …, "keyword": … },
+                 "node" | "plan", "timestamp" } ],
+  "vlm_answer": "…" }
+```
+
+### 6.4 融合 pipeline（伪码）
+
+```text
+cand      = prefilter(domain, tags, time)        # tag 倒排 + 时间窗 + domain
+rankings  = { r: route_r(query, cand) for r in routes }   # 可并行
+fused     = RRF(rankings, weights)               # 逐文档累加 1/(60+rank)
+topk      = fused.sort(desc)[:top_k]
+if vlm_qa: topk = gap_cluster(topk) → multi_image_vlm(topk)
+```
+
+### 6.5 代码映射（复用 vs 新增）
+
+- **复用**：`TagIndex.query`、`VectorStore.search`、`MilvusBackend.search`、
+  `llm_search.llm_rank`、`retrieve.py` 因果扩展、`vlm_answer_question` +
+  `llm_decide_vlm`、`_relative_window_ns`。
+- **新增**：`core/fusion.py`（RRF + weighted + router）；`mem_remember` /
+  `mem_search` 两个 handler + 统一 schema；`type` / `domain` 判别。
+- **删除 / 别名**：`hybrid_search`、`vector_search`、`ptdl_retrieve`、
+  `search_history` → 并入 `mem_search`；`ptdl_remember` → `mem_remember`；
+  `promote` → 内部自动。
+
+### 6.6 迁移与兼容
+
+1. 新增 `mem_search` / `mem_remember`，旧 tool 先并行保留。
+2. 旧 tool 转别名 → 转发新入口，打 deprecation 日志。
+3. 确认 Pilot / 调用方切走后删旧 tool。
+4. `promote` 改写入超限 / 后台触发。
+
+### 6.7 取舍 / 风险
+
+- 混合 domain 用 RRF（名次融合）比 score 融合稳，但 scene/plan 语义空间差异
+  仍在，`domain=all` 可能偏科 → 建议默认由调用意图给 domain，或 all 时按域召回
+  再 RRF。
+- `llm` 路贵，默认关闭。
+- 改名 / 删 RPC 属对外接口变更，需确认后再动代码。

@@ -41,6 +41,8 @@ import threading
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
+from .constants import SHOT_MIN_INTERVAL_NS
+
 log = logging.getLogger("scribe_mem")
 
 # Max VLM API retries on transient errors.
@@ -240,9 +242,9 @@ class VLMObserver(threading.Thread):
         self._queue: queue.Queue = queue.Queue()
 
         # Dedup state (guarded by self._lock since accessed from worker only)
-        #   _seg_dedup: (path_node_id, label) → node_id   (per-segment)
+        #   _seg_dedup: (path_node_id, label) → (node_id, last_shot_ns)
         #   _global_dedup: label → [(node_id, x, y, path_ids), ...]  (cross-segment)
-        self._seg_dedup: Dict[Tuple[int, str], int] = {}
+        self._seg_dedup: Dict[Tuple[int, str], Tuple[int, int]] = {}
         self._global_dedup: Dict[str, List[Dict[str, Any]]] = {}
         self._lock = threading.Lock()
 
@@ -251,6 +253,7 @@ class VLMObserver(threading.Thread):
         self._objects_found: int = 0
         self._nodes_created: int = 0
         self._nodes_updated: int = 0
+        self._nodes_skipped: int = 0
 
     # ── public API ──────────────────────────────────────────────────────
 
@@ -301,6 +304,7 @@ class VLMObserver(threading.Thread):
             "objects_found": self._objects_found,
             "nodes_created": self._nodes_created,
             "nodes_updated": self._nodes_updated,
+            "nodes_skipped": self._nodes_skipped,
         }
 
     # ── Thread run ──────────────────────────────────────────────────────
@@ -336,9 +340,9 @@ class VLMObserver(threading.Thread):
                 break
 
         log.info("vlm_observer: worker stopped (processed=%d, objects=%d, "
-                 "created=%d, updated=%d)",
+                 "created=%d, updated=%d, skipped=%d)",
                  self._processed, self._objects_found,
-                 self._nodes_created, self._nodes_updated)
+                 self._nodes_created, self._nodes_updated, self._nodes_skipped)
 
     # ── processing ──────────────────────────────────────────────────────
 
@@ -373,10 +377,18 @@ class VLMObserver(threading.Thread):
                 seg_key = (path_node_id, label)
 
                 # ── Per-segment dedup: already have this label? ──
-                existing_nid = self._seg_dedup.get(seg_key)
-                if existing_nid is not None:
-                    # Update existing node: append this image_ref
-                    self._append_image_ref(existing_nid, path_node_id, waypoint, image_b64)
+                existing = self._seg_dedup.get(seg_key)
+                if existing is not None:
+                    nid, last_shot_ns = existing
+                    now = time.time_ns()
+                    # Photographic-memory time gate (design §5): same
+                    # object+position within the shot interval → same shot,
+                    # skip; past it → reuse node + append a new frame.
+                    if now - last_shot_ns <= SHOT_MIN_INTERVAL_NS:
+                        self._nodes_skipped += 1
+                        continue
+                    self._append_image_ref(nid, path_node_id, waypoint, image_b64)
+                    self._seg_dedup[seg_key] = (nid, now)
                     self._nodes_updated += 1
                     continue
 
@@ -385,7 +397,7 @@ class VLMObserver(threading.Thread):
                     label, wx, wy, path_node_id,
                 )
                 if linked_nid is not None:
-                    self._seg_dedup[seg_key] = linked_nid
+                    self._seg_dedup[seg_key] = (linked_nid, time.time_ns())
                     self._nodes_updated += 1
                     continue
 
@@ -394,7 +406,7 @@ class VLMObserver(threading.Thread):
                     path_node_id, waypoint, obj, image_b64,
                 )
                 if node_id is not None and node_id > 0:
-                    self._seg_dedup[seg_key] = node_id
+                    self._seg_dedup[seg_key] = (node_id, time.time_ns())
                     self._global_dedup.setdefault(label, []).append({
                         "node_id": node_id,
                         "x": wx,

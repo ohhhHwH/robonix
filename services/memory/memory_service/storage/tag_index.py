@@ -29,16 +29,30 @@ class TagIndex:
         )
         # node_id -> TagSet (for rebuild / remove)
         self._node_tags: Dict[int, TagSet] = {}
+        # obj_id -> set of node_ids (design §2.5 — stable cross-time object key)
+        self._obj_id_index: Dict[str, Set[int]] = defaultdict(set)
+        # node_id -> obj_ids (for remove / rebuild)
+        self._node_obj_ids: Dict[int, Set[str]] = defaultdict(set)
         # All known node IDs (for "no filter" query)
         self._all_ids: Set[int] = set()
 
     # ── Public API ────────────────────────────────────────────────────
 
-    def insert(self, node_id: int, tags: TagSet) -> None:
+    def insert(self, node_id: int, tags: TagSet, obj_ids=None) -> None:
         """Index a node's tags into all dimension inverted lists."""
         self._all_ids.add(node_id)
         self._node_tags[node_id] = tags
         self._index_tags(node_id, tags)
+        if obj_ids:
+            self.index_obj_ids(node_id, obj_ids)
+
+    def index_obj_ids(self, node_id: int, obj_ids) -> None:
+        """Index a node's stable object ids (design §2.5 — cross-time key)."""
+        ids = set(obj_ids or [])
+        self._node_obj_ids[node_id] |= ids
+        for oid in ids:
+            if oid:
+                self._obj_id_index[oid].add(node_id)
 
     def remove(self, node_id: int) -> None:
         """Remove a node from all indices."""
@@ -47,6 +61,8 @@ class TagIndex:
         if tags is None:
             return
         self._deindex_tags(node_id, tags)
+        for oid in self._node_obj_ids.pop(node_id, set()):
+            self._obj_id_index[oid].discard(node_id)
 
     def query(self, tag_filter: TagFilter) -> Set[int]:
         """Return candidate node_ids matching the filter (AND semantics).
@@ -65,10 +81,14 @@ class TagIndex:
             )
 
         # Spatial: objects (intersection: node must contain ALL requested objects)
+        # Each requested token matches either the free label (objects_present)
+        # OR a stable obj_id (design §2.5 — cross-time object key).
         if tag_filter.objects is not None:
             obj_matches: List[Set[int]] = []
             for obj in tag_filter.objects:
-                obj_matches.append(self._inverted["objects_present"].get(obj, set()))
+                label_hits = self._inverted["objects_present"].get(obj, set())
+                obj_id_hits = self._obj_id_index.get(obj, set())
+                obj_matches.append(label_hits | obj_id_hits)
             if obj_matches:
                 # Node must contain all requested objects
                 obj_intersection = obj_matches[0]
@@ -117,12 +137,18 @@ class TagIndex:
         self._inverted.clear()
         self._node_tags.clear()
         self._all_ids.clear()
+        self._obj_id_index.clear()
+        self._node_obj_ids.clear()
         for node in nodes:
             if node.tags is None:
                 continue
             self._all_ids.add(node.node_id)
             self._node_tags[node.node_id] = node.tags
             self._index_tags(node.node_id, node.tags)
+            if node.spatial_data is not None:
+                obj_ids = [o.obj_id for o in node.spatial_data.objects if o.obj_id]
+                if obj_ids:
+                    self.index_obj_ids(node.node_id, obj_ids)
 
     def count(self) -> int:
         """Number of indexed nodes."""

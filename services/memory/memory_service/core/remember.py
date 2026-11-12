@@ -244,11 +244,15 @@ class RememberPipeline:
 
     def __init__(self, graph_store: GraphStore, tag_index: TagIndex,
                  vector_store: VectorStore,
-                 image_store: "ImageStore | None" = None):
+                 image_store: "ImageStore | None" = None,
+                 object_timeline=None):
         self._graph = graph_store
         self._tags = tag_index
         self._vectors = vector_store
         self._images = image_store
+        # Optional cross-time object index (design §2) — recording is a no-op
+        # when absent so standalone/test constructions stay unchanged.
+        self._object_timeline = object_timeline
 
     async def execute(self, request: RememberRequest) -> RememberResponse:
         """Execute the remember pipeline.
@@ -398,8 +402,17 @@ class RememberPipeline:
                 log.warning("remember: node %d image save FAILED after %dms: %s: %s",
                            node_id, round(img_ms), type(e).__name__, e)
 
-        # 6. Tags first into inverted index
-        self._tags.insert(node_id, tags)
+        # 6. Tags first into inverted index (plus stable obj_id keys — design §2)
+        obj_ids = [o.obj_id for o in (spatial.objects if spatial else []) if o.obj_id]
+        self._tags.insert(node_id, tags, obj_ids=obj_ids)
+
+        # 6b. Record the object timeline (design §2) — one snapshot per object.
+        if self._object_timeline is not None and spatial is not None:
+            for coord in spatial.objects:
+                if coord.obj_id:
+                    self._object_timeline.record(
+                        coord.obj_id, node_id, coord, node.timestamp,
+                    )
 
         # 7. Vector + BM25 index
         self._vectors.insert(node_id, embedding, summary)

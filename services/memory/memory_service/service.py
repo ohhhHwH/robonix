@@ -64,9 +64,11 @@ from .core.types import (  # noqa: E402
     TagFilter, TimeRange, RememberRequest, SearchRequest,
     CameraParams,
 )
+from .constants import SHOT_MIN_INTERVAL_NS  # noqa: E402
 from .storage.graph_store import GraphStore  # noqa: E402
 from .storage.tag_index import TagIndex  # noqa: E402
 from .storage.vector_store import VectorStore  # noqa: E402
+from .storage.object_timeline import ObjectTimeline  # noqa: E402
 from .storage.embedding_config import EmbeddingModelConfig  # noqa: E402
 from .storage.image_store import ImageStore  # noqa: E402
 from .storage.mongo_backend import MongoBackend  # noqa: E402
@@ -76,6 +78,7 @@ from .storage.translator import Translator  # noqa: E402
 from .core.remember import RememberPipeline  # noqa: E402
 from .core.retrieve import RetrievePipeline  # noqa: E402
 from .core.compact import CompactPipeline  # noqa: E402
+from .core.fusion import FusedSearch  # noqa: E402
 
 # ── 2. Backend construction ─────────────────────────────────────────────
 
@@ -219,8 +222,10 @@ _graph = GraphStore(data_dir=MEMORY_DIR, mongo=_mongo, milvus=_milvus,
 _tags = TagIndex()
 _vectors = VectorStore(alpha=0.3, embedding_enabled=_ENABLE_EMBEDDING,
                        embedder=_bge if _ENABLE_EMBEDDING else None)
+_timeline = ObjectTimeline()
 _images = ImageStore(mongo=_mongo)
-_remember_pipe = RememberPipeline(_graph, _tags, _vectors, _images)
+_remember_pipe = RememberPipeline(_graph, _tags, _vectors, _images,
+                                  object_timeline=_timeline)
 _retrieve_pipe = RetrievePipeline(_graph, _tags, _vectors, image_store=_images)
 _compact_pipe = CompactPipeline(_graph)
 
@@ -251,6 +256,7 @@ class MemoryService:
         if data_dir:
             self.graph = GraphStore(data_dir=data_dir)
             self.tags = TagIndex()
+            self.timeline = ObjectTimeline()
             ecfg = embedding_config or EmbeddingModelConfig()
             self.vectors = VectorStore(config=ecfg, alpha=alpha,
                                       embedding_enabled=_ENABLE_EMBEDDING)
@@ -258,10 +264,13 @@ class MemoryService:
             self.graph = _graph
             self.tags = _tags
             self.vectors = _vectors
+            self.timeline = _timeline
 
         # Always create own pipelines bound to own stores
         self._images = ImageStore()
-        self._remember_pipe = RememberPipeline(self.graph, self.tags, self.vectors, self._images)
+        self._remember_pipe = RememberPipeline(self.graph, self.tags, self.vectors,
+                                               self._images,
+                                               object_timeline=self.timeline)
         self._retrieve_pipe = RetrievePipeline(self.graph, self.tags, self.vectors)
         self._compact_pipe = CompactPipeline(self.graph)
 
@@ -273,6 +282,7 @@ class MemoryService:
         nodes = [self.graph.get_node(nid) for nid in self.graph.all_ids()]
         nodes = [n for n in nodes if n is not None]
         self.tags.rebuild(nodes)
+        self.timeline.rebuild(nodes)
         vec_triples = [(n.node_id, n.embedding, n.summary) for n in nodes]
         self.vectors.rebuild(vec_triples)
         log.info("init: rebuilt indices for %d nodes", len(nodes))
@@ -1002,6 +1012,203 @@ if _MCP_AVAILABLE:
                  query[:80], kind, top_k, len(results))
         return _json_ok({"count": len(results), "results": results})
 
+    @_memory_svc.mcp("robonix/service/memory/object_history")
+    async def _mcp_object_history(msg: String) -> String:
+        """Read one object's cross-time history or diff (design §2 ObjectTimeline).
+
+        ``obj_id`` is the stable object key (``ObjectCoord.obj_id``).  Two ops:
+
+        - ``op="history"`` → the object's snapshots, most-recent-first;
+          ``limit`` caps the count (0 = all).
+        - ``op="diff"``   → the two most-recent snapshots plus ``delta``
+          (``dx``/``dy``/``dz`` and Euclidean ``distance``) — the primitive
+          behind "was the globe moved since yesterday?".
+
+        Request JSON:
+        {
+          "obj_id": "exhibit.globe_001",   // required — stable object key
+          "op":     "diff",                 // "history" | "diff" (default "history")
+          "limit":  5                       // history only
+        }
+
+        Response JSON (history):
+        { "obj_id": "…", "count": 2, "history": [ {node_id, timestamp, label, x, y, z} ] }
+        Response JSON (diff):
+        { "obj_id": "…", "latest": {…}, "previous": {…}, "delta": {"dx","dy","dz","distance"} }
+        """
+        req_dict = _parse_json(msg.data, ctx="object_history")
+        if req_dict is None:
+            return _json_error("Invalid JSON", ctx="object_history")
+
+        obj_id = (req_dict.get("obj_id") or "").strip()
+        if not obj_id:
+            return _json_error("Missing required field: obj_id", ctx="object_history")
+
+        op = (req_dict.get("op") or "history").strip().lower()
+        if op not in ("history", "diff"):
+            return _json_error("Invalid op: must be history | diff", ctx="object_history")
+
+        if op == "diff":
+            result = _timeline.diff(obj_id)
+            log.info("API object_history: diff obj_id=%r → %s",
+                     obj_id, "delta=%s" % result.get("delta") if result.get("delta") else "no delta")
+            return _json_ok(result)
+
+        try:
+            limit = max(0, int(req_dict.get("limit", 0)))
+        except (TypeError, ValueError):
+            return _json_error("Invalid limit", ctx="object_history")
+
+        hist = _timeline.history(obj_id, limit=limit)
+        log.info("API object_history: history obj_id=%r → %d snapshots",
+                 obj_id, len(hist))
+        return _json_ok({"obj_id": obj_id, "count": len(hist), "history": hist})
+
+    @_memory_svc.mcp("robonix/service/memory/mem_remember")
+    async def _mcp_mem_remember(msg: String) -> String:
+        """Unified write tool (design §6.5) — dispatch on ``type``.
+
+        ``type="memory"`` (default) → the CKG remember path (same schema as
+        ``remember``); ``type="plan"`` → the ptdl plan path (same schema as
+        ``ptdl_remember``).  The ``type`` key is ignored by the delegated
+        legacy handlers, so no payload rewrite is needed.
+
+        Request JSON:
+          { "type": "memory", ...remember fields... }
+          { "type": "plan",   ...ptdl_remember fields... }
+
+        Response: the delegated handler's response verbatim.
+        """
+        req_dict = _parse_json(msg.data, ctx="mem_remember")
+        if req_dict is None:
+            return _json_error("Invalid JSON", ctx="mem_remember")
+
+        typ = (req_dict.get("type") or "memory").strip().lower()
+        if typ == "plan":
+            return await _mcp_ptdl_remember(msg)
+        if typ == "memory":
+            return await _mcp_remember(msg)
+        return _json_error("Invalid type: must be memory | plan", ctx="mem_remember")
+
+    @_memory_svc.mcp("robonix/service/memory/mem_search")
+    async def _mcp_mem_search(msg: String) -> String:
+        """Unified multi-route recall tool (design §6).
+
+        Runs several retrieval routes over a pre-filtered candidate set —
+        vector (Milvus), keyword (BM25), tag (Jaccard), causal (parent/child
+        expansion) and optional llm re-rank — then fuses their rankings with
+        RRF and returns the re-ranked top-k.  Old tools stay in parallel.
+
+        Request JSON:
+        {
+          "query":  "was the globe moved?",   // required — recall intent
+          "top_k":   5,
+          "domain":  "all",                    // all | memory | scene | plan
+          "routes":  ["vector","keyword","tag","causal"],  // add "llm" to opt in
+          "fusion":  "rrf",                    // rrf | linear
+          "route_weights": {"vector": 1.0},    // optional per-route weight
+          "tags":    {"scene_type": "kitchen", "objects": ["cup"]},  // optional
+          "time":    {"relative_time": "today"} | {"start_ts": <ns>, "end_ts": <ns>},
+          "vlm_qa":  false                     // optional — multi-image VLM answer
+        }
+
+        Response: {"results": [ {doc_id, kind, score, route_scores, timestamp,
+                                 node | plan} ], "vlm_answer": "..."}
+        """
+        req_dict = _parse_json(msg.data, ctx="mem_search")
+        if req_dict is None:
+            return _json_error("Invalid JSON", ctx="mem_search")
+
+        query = (req_dict.get("query") or "").strip()
+        if not query:
+            return _json_error("Missing required field: query", ctx="mem_search")
+
+        domain = (req_dict.get("domain") or "all").strip().lower()
+        if domain not in ("all", "memory", "scene", "plan"):
+            return _json_error("Invalid domain: must be all | memory | scene | plan",
+                              ctx="mem_search")
+
+        try:
+            top_k = max(1, min(int(req_dict.get("top_k", 5)), 100))
+        except (TypeError, ValueError):
+            return _json_error("Invalid top_k", ctx="mem_search")
+
+        fusion = (req_dict.get("fusion") or "rrf").strip().lower()
+        if fusion not in ("rrf", "linear"):
+            return _json_error("Invalid fusion: must be rrf | linear", ctx="mem_search")
+
+        routes = req_dict.get("routes")
+        if routes is not None and not isinstance(routes, list):
+            return _json_error("Invalid routes: must be a list", ctx="mem_search")
+        route_weights = req_dict.get("route_weights") or {}
+        if not isinstance(route_weights, dict):
+            return _json_error("Invalid route_weights", ctx="mem_search")
+
+        tags_filter = None
+        if req_dict.get("tags"):
+            try:
+                tags_filter = TagFilter.from_dict(req_dict["tags"])
+            except Exception as e:
+                return _json_error(f"Invalid tags: {e}", ctx="mem_search")
+
+        # time window: relative_time keyword OR explicit start/end ns
+        time_range = None
+        time_spec = req_dict.get("time") if isinstance(req_dict.get("time"), dict) else {}
+        if req_dict.get("relative_time"):
+            try:
+                time_range = _relative_window_ns(req_dict["relative_time"])
+            except ValueError as e:
+                return _json_error(str(e), ctx="mem_search")
+        elif time_spec.get("start_ts") or time_spec.get("end_ts"):
+            try:
+                time_range = (int(time_spec.get("start_ts", 0)),
+                              int(time_spec.get("end_ts", 0)))
+            except (TypeError, ValueError):
+                return _json_error("Invalid time window", ctx="mem_search")
+
+        searcher = FusedSearch(
+            graph=_graph, tags=_tags, vectors=_vectors,
+            milvus=_milvus, ptdl=_ptdl, bge=_bge,
+        )
+        try:
+            result = await searcher.search(
+                query, top_k=top_k, domain=domain, routes=routes,
+                fusion=fusion, route_weights=route_weights,
+                tags_filter=tags_filter, time_range=time_range,
+            )
+        except Exception as e:
+            log.warning("API mem_search failed: %s: %s", type(e).__name__, e)
+            return _json_error(f"Search failed: {e}", ctx="mem_search")
+
+        # optional multi-image VLM answer over the top scene/memory hits
+        if req_dict.get("vlm_qa"):
+            image_paths: list = []
+            contexts: list = []
+            for r in result["results"][:3]:
+                doc = r.get("doc_id", "")
+                if not doc.isdigit():
+                    continue
+                node = _graph.get_node(int(doc))
+                if node is None:
+                    continue
+                image_paths.extend(node.image_refs or [])
+                contexts.append(node.summary or "")
+            if image_paths or contexts:
+                try:
+                    from .core.observe import vlm_answer_question
+                    answer = await vlm_answer_question(
+                        query, image_paths, contexts, image_store=_images,
+                    )
+                    if answer:
+                        result["vlm_answer"] = answer
+                except Exception as e:
+                    log.warning("API mem_search vlm_qa failed: %s: %s",
+                                type(e).__name__, e)
+
+        log.info("API mem_search: query=%r domain=%s top_k=%d → %d results",
+                 query[:80], domain, top_k, len(result["results"]))
+        return _json_ok(result)
+
     @_memory_svc.on_init
     def _on_init(cfg):
         _ = cfg
@@ -1022,6 +1229,7 @@ if _MCP_AVAILABLE:
             nodes = [_graph.get_node(nid) for nid in _graph.all_ids()]
             nodes = [n for n in nodes if n is not None]
             _tags.rebuild(nodes)
+            _timeline.rebuild(nodes)
             vec_triples = [(n.node_id, n.embedding, n.summary) for n in nodes]
             _vectors.rebuild(vec_triples)
 
@@ -1138,15 +1346,24 @@ def _start_scene_hook_server() -> None:
                         nid = int(existing_nid)
                         node = _graph.get_node(nid)
                         if node is not None:
+                            now = time.time_ns()
+                            # Photographic-memory time gate (design §5): within
+                            # the shot interval the same object+position is the
+                            # SAME shot → skip; past it → reuse node + append.
+                            if now - node.timestamp <= SHOT_MIN_INTERVAL_NS:
+                                self._reply(200, {"node_id": nid, "skipped": True})
+                                return
                             img_b64 = data.get("image_base64", "")
                             if img_b64 and _images is not None:
                                 import base64 as _b64
                                 img_bytes = _b64.b64decode(img_b64)
                                 _images.save(nid, img_bytes)
                                 node.image_refs = _images.list(nid)
-                                _graph.update_node(nid, node)
-                                log.info("scene_hook.http: append_image_ref → node %d (%d images)",
-                                         nid, len(node.image_refs))
+                                node.frame_ts = list(node.frame_ts) + [now]
+                            node.timestamp = now
+                            _graph.update_node(nid, node)
+                            log.info("scene_hook.http: append_image_ref → node %d (%d images)",
+                                     nid, len(node.image_refs))
                             self._reply(200, {"node_id": nid})
                         else:
                             self._reply(404, {"error": f"node {nid} not found"})
@@ -1230,9 +1447,13 @@ def _start_scene_hook_server() -> None:
         """Check whether a node for the same object+position already exists.
 
         Returns the existing node_id, or None.  Dedup key: first object's
-        (label, x_grid, y_grid) at 1.0 m resolution.  When a match is
-        found AND *img_b64* is non-empty, the new image is appended to the
-        existing node's ``image_refs``.
+        (label, x_grid, y_grid) at 1.0 m resolution.
+
+        Photographic-memory time gate (design §5): a match within
+        ``SHOT_MIN_INTERVAL_S`` of the node's latest shot is the same shot
+        and is skipped (no append, no update).  Past that window the node is
+        reused — the new image is appended and ``timestamp`` / ``frame_ts`` /
+        ``version`` are refreshed.
         """
         if spatial is None or not spatial.objects:
             return None
@@ -1240,6 +1461,7 @@ def _start_scene_hook_server() -> None:
         gx = round(float(obj.x))
         gy = round(float(obj.y))
         key = f"{obj.label}@{gx},{gy}"
+        now = time.time_ns()
         # Search existing nodes for the same grid key.
         for nid in _graph.all_ids():
             node = _graph.get_node(nid)
@@ -1252,18 +1474,24 @@ def _start_scene_hook_server() -> None:
             ngy = round(float(no.y))
             nkey = f"{no.label}@{ngx},{ngy}"
             if nkey == key:
-                # Append image if provided.
+                # Within the gate → same shot, skip (no append / update).
+                if now - node.timestamp <= SHOT_MIN_INTERVAL_NS:
+                    log.info("scene_hook.dedup: node %d within shot gate — skipping", nid)
+                    return nid
+                # Past the gate → reuse node, append image, refresh shot time.
                 if img_b64 and _images is not None:
                     import base64 as _b64
                     try:
                         img_bytes = _b64.b64decode(img_b64)
                         _images.save(nid, img_bytes)
                         node.image_refs = _images.list(nid)
-                        _graph.update_node(nid, node)
+                        node.frame_ts = list(node.frame_ts) + [now]
                         log.info("scene_hook.dedup: appended image to node %d (%d total)",
                                  nid, len(node.image_refs))
                     except Exception as e:
                         log.warning("scene_hook.dedup: image append failed: %s", e)
+                node.timestamp = now
+                _graph.update_node(nid, node)
                 return nid
         return None
 

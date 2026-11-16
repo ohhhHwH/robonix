@@ -259,12 +259,97 @@ class TestConstrainedCombination:
         assert len(res["results"]) == 1
 
 
+class _FakeBge:
+    def encode(self, text):
+        return [1.0, 0.0]
+
+
+class _FakeMilvus:
+    def __init__(self, hits):
+        self._hits = hits
+
+    def search(self, qvec, **kw):
+        return self._hits
+
+
+class TestSimilarityGap:
+    """vector-route raw similarity + gap-based ``ambiguous`` selection."""
+
+    def setup_method(self):
+        self.tmp = tempfile.mkdtemp()
+        self.svc = MemoryService(data_dir=self.tmp)
+        asyncio.run(self.svc.init())
+        asyncio.run(self.svc.remember(
+            session_id="sess-1", plan_id="plan-1",
+            log_record=LogRecord(level="Info", tag="vlm",
+                                 msg="observed globe on the desk"),
+            spatial=SpatialContext(
+                objects=[ObjectCoord(obj_id="obj.globe", label="globe",
+                                     x=1.0, y=2.0, z=0.5)], origin="t"),
+            kv={"node_type": "object_observation"},
+        ))
+        asyncio.run(self.svc.remember(
+            session_id="sess-1", plan_id="plan-1",
+            log_record=LogRecord(level="Info", tag="vlm",
+                                 msg="observed cup on the table"),
+            spatial=SpatialContext(
+                objects=[ObjectCoord(obj_id="obj.cup", label="cup",
+                                     x=0.0, y=0.0, z=0.0)], origin="t"),
+            kv={"node_type": "object_observation"},
+        ))
+        ids = sorted(self.svc.graph.all_ids())
+        self.globe_id, self.cup_id = ids[0], ids[1]
+        self.search = FusedSearch(
+            graph=self.svc.graph, tags=self.svc.tags, vectors=self.svc.vectors,
+            milvus=_FakeMilvus(self._hits(0.90, 0.70)),
+            bge=_FakeBge(),
+        )
+
+    def _hits(self, globe, cup):
+        return [
+            {"doc_id": str(self.globe_id), "kind": "scene",
+             "node_type": "object_observation", "timestamp": 1, "score": globe},
+            {"doc_id": str(self.cup_id), "kind": "scene",
+             "node_type": "object_observation", "timestamp": 2, "score": cup},
+        ]
+
+    def teardown_method(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_similarity_exposed_and_gap_marks_ambiguous(self):
+        res = asyncio.run(self.search.search(
+            "globe", top_k=5, domain="scene", routes=["vector"], gap=0.05,
+        ))
+        assert res["gap"] == 0.05
+        assert len(res["results"]) == 2
+        r0, r1 = res["results"]
+        assert r0["similarity"] == 0.9
+        assert r1["similarity"] == 0.7
+        assert r0["ambiguous"] is True
+        assert r1["ambiguous"] is False   # 0.9 - 0.7 = 0.2 > 0.05
+
+    def test_tight_scores_all_ambiguous(self):
+        self.search._milvus = _FakeMilvus(self._hits(0.90, 0.88))
+        res = asyncio.run(self.search.search(
+            "globe", top_k=5, domain="scene", routes=["vector"], gap=0.05,
+        ))
+        assert [r["ambiguous"] for r in res["results"]] == [True, True]
+
+    def test_no_gap_omits_ambiguous(self):
+        res = asyncio.run(self.search.search(
+            "globe", top_k=5, domain="scene", routes=["vector"],
+        ))
+        assert "gap" not in res
+        assert "ambiguous" not in res["results"][0]
+        assert res["results"][0]["similarity"] == 0.9
+
+
 # ── Runner ───────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     import traceback
     tests = [TestNodeRoutes(), TestPlanRoute(), TestSceneObjectRetrieval(),
-             TestConstrainedCombination()]
+             TestConstrainedCombination(), TestSimilarityGap()]
     passed = failed = 0
     for obj in tests:
         cls_name = type(obj).__name__

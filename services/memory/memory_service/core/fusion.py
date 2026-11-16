@@ -68,6 +68,21 @@ def rank_from_scores(scored: Iterable[Tuple[str, float]]) -> List[str]:
     return [doc_id for doc_id, _ in scored]
 
 
+def mark_ambiguous(results: List[Dict[str, Any]], gap: float) -> List[Dict[str, Any]]:
+    """Tag each result ``ambiguous=True`` when its ``similarity`` is within
+    ``gap`` of the best similarity in the list (the "not much different" set).
+
+    Results whose ``similarity`` is ``None`` (not scored by the vector route)
+    are never ambiguous.  Mutates and returns ``results`` in place.
+    """
+    best = max((r.get("similarity") for r in results
+                if r.get("similarity") is not None), default=None)
+    for r in results:
+        s = r.get("similarity")
+        r["ambiguous"] = best is not None and s is not None and (best - s) <= gap
+    return results
+
+
 def weighted_linear_fusion(
     score_maps: Dict[str, Dict[str, float]],
     weights: Optional[Dict[str, float]] = None,
@@ -163,18 +178,27 @@ class FusedSearch:
         route_weights: Optional[Dict[str, float]] = None,
         tags_filter: Optional[TagFilter] = None,
         time_range: Optional[Tuple[int, int]] = None,
+        gap: Optional[float] = None,
     ) -> Dict[str, Any]:
-        """Run the fused search and return a ``{"results": [...]}`` dict."""
+        """Run the fused search and return a ``{"results": [...]}`` dict.
+
+        Each result carries ``similarity`` — the raw vector-route cosine
+        (``None`` when the vector route did not score it).  When ``gap`` is
+        set, each result also carries ``ambiguous`` (``True`` when its
+        similarity is within ``gap`` of the best similarity in the top-k).
+        """
         routes = list(routes or DEFAULT_ROUTES)
         overfetch = max(top_k * 3, 20)
 
         node_ids, plan_entries = self._prefilter(domain, tags_filter, time_range)
 
         rankings: Dict[str, List[str]] = {}
+        vector_scores: Dict[str, float] = {}
         if "vector" in routes:
-            v = self._vector_ranking(query, domain, time_range, overfetch)
+            v, vs = self._vector_ranking(query, domain, time_range, overfetch)
             if v:
                 rankings["vector"] = v
+                vector_scores.update(vs)
         if "keyword" in routes:
             kw = self._keyword_ranking(query, node_ids, plan_entries, overfetch)
             if kw:
@@ -205,16 +229,22 @@ class FusedSearch:
                 continue
             route_scores = {r: rank_map[r].get(doc_id)
                             for r in rankings if doc_id in rank_map[r]}
+            sim = vector_scores.get(doc_id)
             results.append({
                 "doc_id": doc_id,
                 "kind": item["kind"],
                 "score": round(score, 6),
+                "similarity": round(sim, 6) if sim is not None else None,
                 "route_scores": route_scores,
                 "timestamp": item["timestamp"],
                 item["kind"]: item["payload"],
             })
 
-        return {"results": results}
+        out: Dict[str, Any] = {"results": results}
+        if gap is not None:
+            mark_ambiguous(results, gap)
+            out["gap"] = gap
+        return out
 
     # ── prefilter ──────────────────────────────────────────────────────
 
@@ -261,12 +291,12 @@ class FusedSearch:
 
     def _vector_ranking(self, query: str, domain: str,
                         time_range: Optional[Tuple[int, int]],
-                        overfetch: int) -> List[str]:
+                        overfetch: int) -> Tuple[List[str], Dict[str, float]]:
         if self._milvus is None or self._bge is None:
-            return []
+            return [], {}
         qvec = self._bge.encode(query)
         if not qvec:
-            return []
+            return [], {}
         hits: List[Dict[str, Any]] = []
         if domain in ("scene", "all"):
             hits.extend(self._milvus.search(qvec, top_k=overfetch, kind="scene",
@@ -275,7 +305,12 @@ class FusedSearch:
             hits.extend(self._milvus.search(qvec, top_k=overfetch, kind="plan",
                                             time_range=time_range))
         hits.sort(key=lambda h: h.get("score", 0.0), reverse=True)
-        return [h["doc_id"] for h in hits]
+        # keep the best (highest) raw similarity per doc — Milvus returns a
+        # similarity score for BGE-M3, so higher is more similar.
+        scores: Dict[str, float] = {}
+        for h in hits:
+            scores.setdefault(h["doc_id"], float(h.get("score", 0.0)))
+        return [h["doc_id"] for h in hits], scores
 
     def _keyword_ranking(self, query: str, node_ids: Set[int],
                          plan_entries: List[Dict[str, Any]],

@@ -1109,11 +1109,19 @@ if _MCP_AVAILABLE:
           "route_weights": {"vector": 1.0},    // optional per-route weight
           "tags":    {"scene_type": "kitchen", "objects": ["cup"]},  // optional
           "time":    {"relative_time": "today"} | {"start_ts": <ns>, "end_ts": <ns>},
+          "gap":     0.05,                     // optional — similarity gap for
+                                               // "not much different" selection
           "vlm_qa":  false                     // optional — multi-image VLM answer
         }
 
-        Response: {"results": [ {doc_id, kind, score, route_scores, timestamp,
-                                 node | plan} ], "vlm_answer": "..."}
+        Response: {"results": [ {doc_id, kind, score, similarity, ambiguous,
+                                 route_scores, timestamp, node | plan} ],
+                   "gap": 0.05, "vlm_answer": "..."}
+
+        ``similarity`` is the raw vector-route cosine (or null); ``ambiguous``
+        marks the results within ``gap`` of the best similarity.  With
+        ``vlm_qa``, those ambiguous results — not a fixed top-3 — are sent to
+        the VLM together.
         """
         req_dict = _parse_json(msg.data, ctx="mem_search")
         if req_dict is None:
@@ -1151,6 +1159,18 @@ if _MCP_AVAILABLE:
             except Exception as e:
                 return _json_error(f"Invalid tags: {e}", ctx="mem_search")
 
+        # similarity gap for "not much different" selection (default 0.05).
+        gap = req_dict.get("gap", 0.05)
+        if gap is not None:
+            try:
+                gap = float(gap)
+                if not (0.0 <= gap <= 1.0):
+                    return _json_error("Invalid gap: must be a number in [0, 1]",
+                                       ctx="mem_search")
+            except (TypeError, ValueError):
+                return _json_error("Invalid gap: must be a number in [0, 1]",
+                                   ctx="mem_search")
+
         # time window: relative_time keyword OR explicit start/end ns
         time_range = None
         time_spec = req_dict.get("time") if isinstance(req_dict.get("time"), dict) else {}
@@ -1175,16 +1195,21 @@ if _MCP_AVAILABLE:
                 query, top_k=top_k, domain=domain, routes=routes,
                 fusion=fusion, route_weights=route_weights,
                 tags_filter=tags_filter, time_range=time_range,
+                gap=gap,
             )
         except Exception as e:
             log.warning("API mem_search failed: %s: %s", type(e).__name__, e)
             return _json_error(f"Search failed: {e}", ctx="mem_search")
 
-        # optional multi-image VLM answer over the top scene/memory hits
+        # optional multi-image VLM answer over the ambiguous ("not much
+        # different") hits; fall back to top-3 when none are ambiguous.
         if req_dict.get("vlm_qa"):
             image_paths: list = []
             contexts: list = []
-            for r in result["results"][:3]:
+            selected = [r for r in result["results"] if r.get("ambiguous")]
+            if not selected:
+                selected = result["results"][:3]
+            for r in selected:
                 doc = r.get("doc_id", "")
                 if not doc.isdigit():
                     continue

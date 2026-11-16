@@ -5,7 +5,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from memory_service.core.fusion import (
     reciprocal_rank_fusion, rank_from_scores, weighted_linear_fusion, fuse,
-    RRF_K,
+    mark_ambiguous, RRF_K,
 )
 
 
@@ -81,12 +81,43 @@ class TestRankFromScores:
         assert rank_from_scores([("a", 0.9), ("b", 0.5)]) == ["a", "b"]
 
 
+class TestMarkAmbiguous:
+    @staticmethod
+    def _rs(*sims):
+        return [{"similarity": s} for s in sims]
+
+    def test_tight_scores_all_ambiguous(self):
+        rs = mark_ambiguous(self._rs(0.80, 0.79, 0.78), 0.05)
+        assert [r["ambiguous"] for r in rs] == [True, True, True]
+
+    def test_clear_gap_only_top(self):
+        rs = mark_ambiguous(self._rs(0.90, 0.70, 0.69), 0.05)
+        assert [r["ambiguous"] for r in rs] == [True, False, False]
+
+    def test_partial_prefix(self):
+        rs = mark_ambiguous(self._rs(0.80, 0.78, 0.76, 0.70), 0.05)
+        assert [r["ambiguous"] for r in rs] == [True, True, True, False]
+
+    def test_none_similarity_never_ambiguous(self):
+        rs = mark_ambiguous([{"similarity": None}, {"similarity": 0.9}], 0.05)
+        assert rs[0]["ambiguous"] is False
+        assert rs[1]["ambiguous"] is True
+
+    def test_all_none_no_ambiguous(self):
+        rs = mark_ambiguous([{"similarity": None}, {"similarity": None}], 0.05)
+        assert [r["ambiguous"] for r in rs] == [False, False]
+
+    def test_gap_zero_only_exact_best(self):
+        rs = mark_ambiguous(self._rs(0.9, 0.9, 0.8), 0.0)
+        assert [r["ambiguous"] for r in rs] == [True, True, False]
+
+
 # ── Runner ───────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     import traceback
     tests = [TestReciprocalRankFusion(), TestLinearFusion(),
-             TestFuseDispatch(), TestRankFromScores()]
+             TestFuseDispatch(), TestRankFromScores(), TestMarkAmbiguous()]
     passed = failed = 0
     for obj in tests:
         cls_name = type(obj).__name__
